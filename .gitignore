@@ -1,0 +1,41 @@
+# User-specific files
+settings.json
+
+# Log files
+logs/
+*.log
+
+# Build outputs
+bin/
+obj/
+out/
+
+# PowerShell Gallery publishing artifacts
+*.nupkg
+
+# Test results
+TestResults/
+*.trx
+
+# Coverage reports
+coverage/
+*.coverage
+
+# Visual Studio Code
+.vscode/
+*.code-workspace
+
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Temporary files
+*.tmp
+*.temp
+~*
+
+# Backup files
+*.bak
+*.backup
+*~
