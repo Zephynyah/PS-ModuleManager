@@ -18,8 +18,19 @@ try {
     Write-Host "DNS Host Name    : $($rootDSE.dnsHostName)"
 }
 catch {
-    Write-Host "ERROR: Could not connect to domain via ADSI. Are you domain-joined?" -ForegroundColor Red
-    Write-Host $_.Exception.Message
+    Write-Host "ADSI not available -- falling back to local computer." -ForegroundColor Yellow
+    Write-Host $_.Exception.Message -ForegroundColor DarkYellow
+
+    $localName = $env:COMPUTERNAME
+    $localDns  = try { [System.Net.Dns]::GetHostEntry('').HostName } catch { $localName }
+    $localOS   = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
+
+    Write-Host "`n=== Local Computer Info ===" -ForegroundColor Cyan
+    Write-Host "Computer Name : " -NoNewline; Write-Host $localName -ForegroundColor Green
+    Write-Host "DNS Host Name : $localDns"
+    Write-Host "OS            : $localOS"
+    Write-Host ""
+    Write-Host "Tip: The tool will target this machine when ADSI is unavailable." -ForegroundColor Yellow
     return
 }
 

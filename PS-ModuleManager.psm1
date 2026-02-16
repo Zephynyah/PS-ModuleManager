@@ -380,7 +380,32 @@ function Get-PSMMComputers {
         $searcher.Dispose()
     }
     catch {
-        Write-PSMMLog -Severity 'ERROR' -Message "AD query failed: $_"
+        Write-PSMMLog -Severity 'WARN' -Message "AD query failed: $_  -- falling back to local computer."
+
+        # Fallback: add the local computer so the tool remains usable off-domain
+        $localName = $env:COMPUTERNAME
+        $localDns  = try { [System.Net.Dns]::GetHostEntry('').HostName } catch { $localName }
+        $localOS   = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
+
+        $reachable = $null
+        if ($TestReachability) {
+            try {
+                $null = Test-WSMan -ComputerName $localDns -ErrorAction Stop
+                $reachable = $true
+            }
+            catch { $reachable = $false }
+        }
+
+        $null = $computers.Add([PSCustomObject]@{
+                Name        = $localName
+                DNSHostName = $localDns
+                OU          = ''
+                Enabled     = $true
+                OS          = $localOS
+                Reachable   = $reachable
+            })
+
+        Write-PSMMLog -Severity 'INFO' -Message "Added local computer '$localName' as fallback."
     }
 
     return $computers.ToArray()
@@ -517,7 +542,17 @@ function Receive-PSMMJobs {
             try {
                 $job.Result = $job.PowerShell.EndInvoke($job.Handle)
                 if ($job.PowerShell.HadErrors) {
-                    $job.Error = ($job.PowerShell.Streams.Error | ForEach-Object { $_.ToString() }) -join '; '
+                    $errMsg = ($job.PowerShell.Streams.Error | ForEach-Object { $_.ToString() }) -join '; '
+                    if (-not $errMsg) {
+                        $errMsg = ($job.PowerShell.Streams.Warning | ForEach-Object { $_.ToString() }) -join '; '
+                    }
+                    if (-not $errMsg -and $job.Result) {
+                        # Check if the result contains an _ERROR_ marker from the inventory script
+                        $errorResult = $job.Result | Where-Object { $_.ModuleName -eq '_ERROR_' } | Select-Object -First 1
+                        if ($errorResult) { $errMsg = $errorResult.ModuleBase }
+                    }
+                    if (-not $errMsg) { $errMsg = 'Unknown error (no details captured).' }
+                    $job.Error  = $errMsg
                     $job.Status = 'Failed'
                     Write-PSMMLog -Severity 'ERROR' -Message "Job $($job.Id) failed: $($job.Error)" -ComputerName $job.ComputerName
                 }
@@ -634,9 +669,16 @@ function Get-PSMMRemoteModules {
             } else {
                 $sb = { Get-Module -ListAvailable | Select-Object Name, @{N = 'Version'; E = { $_.Version.ToString() } }, ModuleBase }
             }
-            $splat = @{ ComputerName = $Computer; ScriptBlock = $sb }
-            if ($Cred) { $splat['Credential'] = $Cred }
-            $modules = Invoke-Command @splat -ErrorAction Stop
+
+            $isLocal = ($Computer -eq $env:COMPUTERNAME) -or ($Computer -eq 'localhost') -or ($Computer -eq '.')
+            if ($isLocal) {
+                # Run locally -- no WinRM needed
+                $modules = & $sb
+            } else {
+                $splat = @{ ComputerName = $Computer; ScriptBlock = $sb }
+                if ($Cred) { $splat['Credential'] = $Cred }
+                $modules = Invoke-Command @splat -ErrorAction Stop
+            }
             if ($ModFilter -and -not $modules) {
                 # Module not found on remote computer -- return explicit 'Not Installed' entry
                 [PSCustomObject]@{
@@ -841,40 +883,47 @@ function Install-PSMMModule {
     $installScript = {
         param($Computer, $Cred, $ModName, $Ver, $Source)
         try {
-            $splat = @{
-                ComputerName = $Computer
-                ErrorAction  = 'Stop'
-                ScriptBlock  = {
-                    param($ModName, $Ver, $Source)
-                    $destRoot = Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'
-                    $destPath = Join-Path $destRoot "$ModName\$Ver"
+            $innerSb = {
+                param($ModName, $Ver, $Source)
+                $destRoot = Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'
+                $destPath = Join-Path $destRoot "$ModName\$Ver"
 
-                    if (-not (Test-Path $destPath)) {
-                        New-Item -ItemType Directory -Path $destPath -Force | Out-Null
-                    }
-
-                    # Check for ZIP or folder
-                    $zipFile = Get-ChildItem -LiteralPath $Source -Filter '*.zip' -ErrorAction SilentlyContinue | Select-Object -First 1
-                    if ($zipFile) {
-                        Expand-Archive -LiteralPath $zipFile.FullName -DestinationPath $destPath -Force
-                    }
-                    else {
-                        Copy-Item -Path "$Source\*" -Destination $destPath -Recurse -Force
-                    }
-
-                    # Validate
-                    $loaded = Get-Module -ListAvailable -Name $ModName | Where-Object { $_.Version.ToString() -eq $Ver }
-                    if ($loaded) {
-                        "SUCCESS: $ModName v$Ver installed on $env:COMPUTERNAME"
-                    }
-                    else {
-                        "WARNING: Files copied but module not detected in Get-Module for $ModName v$Ver"
-                    }
+                if (-not (Test-Path $destPath)) {
+                    New-Item -ItemType Directory -Path $destPath -Force | Out-Null
                 }
-                ArgumentList = @($ModName, $Ver, $Source)
+
+                # Check for ZIP or folder
+                $zipFile = Get-ChildItem -LiteralPath $Source -Filter '*.zip' -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($zipFile) {
+                    Expand-Archive -LiteralPath $zipFile.FullName -DestinationPath $destPath -Force
+                }
+                else {
+                    Copy-Item -Path "$Source\*" -Destination $destPath -Recurse -Force
+                }
+
+                # Validate
+                $loaded = Get-Module -ListAvailable -Name $ModName | Where-Object { $_.Version.ToString() -eq $Ver }
+                if ($loaded) {
+                    "SUCCESS: $ModName v$Ver installed on $env:COMPUTERNAME"
+                }
+                else {
+                    "WARNING: Files copied but module not detected in Get-Module for $ModName v$Ver"
+                }
             }
-            if ($Cred) { $splat['Credential'] = $Cred }
-            Invoke-Command @splat
+
+            $isLocal = ($Computer -eq $env:COMPUTERNAME) -or ($Computer -eq 'localhost') -or ($Computer -eq '.')
+            if ($isLocal) {
+                & $innerSb $ModName $Ver $Source
+            } else {
+                $splat = @{
+                    ComputerName = $Computer
+                    ErrorAction  = 'Stop'
+                    ScriptBlock  = $innerSb
+                    ArgumentList = @($ModName, $Ver, $Source)
+                }
+                if ($Cred) { $splat['Credential'] = $Cred }
+                Invoke-Command @splat
+            }
         }
         catch {
             "ERROR on ${Computer}: $_"
@@ -918,34 +967,41 @@ function Uninstall-PSMMModule {
     $removeScript = {
         param($Computer, $Cred, $ModName, $Ver)
         try {
-            $splat = @{
-                ComputerName = $Computer
-                ErrorAction  = 'Stop'
-                ScriptBlock  = {
-                    param($ModName, $Ver)
-                    # Unload if loaded
-                    Remove-Module -Name $ModName -Force -ErrorAction SilentlyContinue
+            $innerSb = {
+                param($ModName, $Ver)
+                # Unload if loaded
+                Remove-Module -Name $ModName -Force -ErrorAction SilentlyContinue
 
-                    $destRoot = Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'
-                    if ($Ver) {
-                        $target = Join-Path $destRoot "$ModName\$Ver"
-                    }
-                    else {
-                        $target = Join-Path $destRoot $ModName
-                    }
-
-                    if (Test-Path $target) {
-                        Remove-Item -LiteralPath $target -Recurse -Force
-                        "SUCCESS: Removed $target on $env:COMPUTERNAME"
-                    }
-                    else {
-                        "WARNING: Path not found: $target on $env:COMPUTERNAME"
-                    }
+                $destRoot = Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'
+                if ($Ver) {
+                    $target = Join-Path $destRoot "$ModName\$Ver"
                 }
-                ArgumentList = @($ModName, $Ver)
+                else {
+                    $target = Join-Path $destRoot $ModName
+                }
+
+                if (Test-Path $target) {
+                    Remove-Item -LiteralPath $target -Recurse -Force
+                    "SUCCESS: Removed $target on $env:COMPUTERNAME"
+                }
+                else {
+                    "WARNING: Path not found: $target on $env:COMPUTERNAME"
+                }
             }
-            if ($Cred) { $splat['Credential'] = $Cred }
-            Invoke-Command @splat
+
+            $isLocal = ($Computer -eq $env:COMPUTERNAME) -or ($Computer -eq 'localhost') -or ($Computer -eq '.')
+            if ($isLocal) {
+                & $innerSb $ModName $Ver
+            } else {
+                $splat = @{
+                    ComputerName = $Computer
+                    ErrorAction  = 'Stop'
+                    ScriptBlock  = $innerSb
+                    ArgumentList = @($ModName, $Ver)
+                }
+                if ($Cred) { $splat['Credential'] = $Cred }
+                Invoke-Command @splat
+            }
         }
         catch {
             "ERROR on ${Computer}: $_"
@@ -1302,7 +1358,10 @@ $script:MainWindowXaml = @'
                 <DockPanel>
                     <DockPanel DockPanel.Dock="Top">
                         <TextBlock Text="Log" FontWeight="Bold" FontSize="13" Margin="8,5" Foreground="{StaticResource AccentBlue}"/>
-                        <Button Name="BtnClearLog" Content="Clear" HorizontalAlignment="Right" Background="#4A4A4A" BorderBrush="#5A5A5A" Margin="5,3" Padding="10,4" FontSize="11"/>
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                            <Button Name="BtnExportLog" Content="Export" Background="#4A4A4A" BorderBrush="#5A5A5A" Margin="5,3" Padding="10,4" FontSize="11"/>
+                            <Button Name="BtnClearLog" Content="Clear" Background="#4A4A4A" BorderBrush="#5A5A5A" Margin="5,3" Padding="10,4" FontSize="11"/>
+                        </StackPanel>
                     </DockPanel>
                     <ListBox Name="LogListBox" Margin="5,0,5,5" FontFamily="Consolas" FontSize="11.5" Background="#1E1E1E" BorderThickness="0"/>
                 </DockPanel>
@@ -1774,6 +1833,29 @@ function Register-PSMMMainWindowEvents {
             $listBox.UnselectAll()
         })
 
+    # ── Export Log ───────────────────────────────────────────────────────────
+    $btnExportLog = Find-PSMMControl -Window $Window -Name 'BtnExportLog'
+    $btnExportLog.Add_Click({
+            $logBox = Find-PSMMControl -Window $script:MainWindow -Name 'LogListBox'
+            if ($logBox.Items.Count -eq 0) {
+                [System.Windows.MessageBox]::Show('No log entries to export.', 'Info', 'OK', 'Information')
+                return
+            }
+            $dlg = [Microsoft.Win32.SaveFileDialog]::new()
+            $dlg.Title = 'Export Log'
+            $dlg.Filter = 'Log files (*.log)|*.log|Text files (*.txt)|*.txt|All files (*.*)|*.*'
+            $dlg.FileName = "PS-ModuleManager_$(Get-Date -Format 'yyyy-MM-dd_HHmmss').log"
+            if ($dlg.ShowDialog()) {
+                try {
+                    $logBox.Items | Out-File -FilePath $dlg.FileName -Encoding UTF8
+                    Write-PSMMLog -Severity 'INFO' -Message "Log exported to $($dlg.FileName)"
+                }
+                catch {
+                    [System.Windows.MessageBox]::Show("Failed to export log:`n$_", 'Error', 'OK', 'Error')
+                }
+            }
+        })
+
     # ── Clear Log ────────────────────────────────────────────────────────────
     $btnClearLog = Find-PSMMControl -Window $Window -Name 'BtnClearLog'
     $btnClearLog.Add_Click({
@@ -1984,8 +2066,19 @@ function Get-ADSIInfo {
         Write-Host "DNS Host Name    : $($rootDSE.dnsHostName)"
     }
     catch {
-        Write-Host "ERROR: Could not connect to domain via ADSI. Are you domain-joined?" -ForegroundColor Red
-        Write-Host $_.Exception.Message
+        Write-Host "ADSI not available -- falling back to local computer." -ForegroundColor Yellow
+        Write-Host $_.Exception.Message -ForegroundColor DarkYellow
+
+        $localName = $env:COMPUTERNAME
+        $localDns  = try { [System.Net.Dns]::GetHostEntry('').HostName } catch { $localName }
+        $localOS   = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
+
+        Write-Host "`n=== Local Computer Info ===" -ForegroundColor Cyan
+        Write-Host "Computer Name : " -NoNewline; Write-Host $localName -ForegroundColor Green
+        Write-Host "DNS Host Name : $localDns"
+        Write-Host "OS            : $localOS"
+        Write-Host ""
+        Write-Host "Tip: The tool will target this machine when ADSI is unavailable." -ForegroundColor Yellow
         return
     }
 
