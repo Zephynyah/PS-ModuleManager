@@ -1338,7 +1338,7 @@ $script:MainWindowXaml = @'
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="170" MinWidth="140"/>
+                <ColumnDefinition Width="210" MinWidth="170"/>
             </Grid.ColumnDefinitions>
             <Grid.RowDefinitions>
                 <RowDefinition Height="*"/>
@@ -1410,8 +1410,7 @@ $script:MainWindowXaml = @'
             <GridSplitter Grid.Column="3" Grid.Row="0" Grid.RowSpan="3" Width="4" Background="#3C3C3C" HorizontalAlignment="Center" VerticalAlignment="Stretch"/>
 
             <!-- ── RIGHT: Actions Panel ──────────────────── -->
-            <Border Grid.Column="4" Grid.Row="0" Grid.RowSpan="3"
-                    Background="{StaticResource PanelBg}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1,0,0,0">
+            <Border Grid.Column="4" Grid.Row="0" Grid.RowSpan="3" Background="{StaticResource PanelBg}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1,0,0,0">
                 <StackPanel Margin="8">
                     <TextBlock Text="Actions" FontWeight="Bold" FontSize="14" Margin="0,5,0,10" Foreground="{StaticResource AccentBlue}"/>
 
@@ -2059,6 +2058,9 @@ function Start-PSMMJobPoller {
     $timer = [System.Windows.Threading.DispatcherTimer]::new()
     $timer.Interval = [TimeSpan]::FromMilliseconds(500)
 
+    # Capture operation label for use inside the closure
+    $op = $Operation
+
     $timer.Add_Tick({
             $completed = Receive-PSMMJobs
             $running = ($script:Jobs | Where-Object { $_.Status -eq 'Running' }).Count
@@ -2116,6 +2118,35 @@ function Start-PSMMJobPoller {
                         foreach ($c in $compared) {
                             $grid.Items.Add($c)
                         }
+                    }
+                }
+
+                # After Install/Update/Remove, auto-refresh inventory for affected computers
+                if ($op -in @('Install', 'Update', 'Remove')) {
+                    # Gather the distinct computer names from the jobs that just finished
+                    $affectedComputers = @($script:Jobs | Where-Object { $_.Status -ne 'Running' } | ForEach-Object { $_.ComputerName } | Select-Object -Unique)
+                    if ($affectedComputers.Count -gt 0) {
+                        Write-PSMMLog -Severity 'INFO' -Message "Auto-refreshing inventory for $($affectedComputers.Count) computer(s) after $op ..."
+
+                        # Clear existing grid rows for affected computers
+                        $grid = Find-PSMMControl -Window $script:MainWindow -Name 'ModuleDataGrid'
+                        if ($grid) {
+                            $toRemove = @()
+                            foreach ($item in $grid.Items) {
+                                if ($item -is [PSCustomObject] -and $affectedComputers -contains $item.ComputerName) {
+                                    $toRemove += $item
+                                }
+                            }
+                            foreach ($item in $toRemove) { $grid.Items.Remove($item) }
+                        }
+
+                        # Determine module filter from the combo box
+                        $cmbMod = Find-PSMMControl -Window $script:MainWindow -Name 'CmbModule'
+                        $modFilter = if ($cmbMod -and $cmbMod.SelectedItem) { $cmbMod.SelectedItem.ToString() } else { $null }
+
+                        # Launch the inventory and poll it
+                        $null = Get-PSMMRemoteModules -ComputerNames $affectedComputers -ModuleName $modFilter
+                        Start-PSMMJobPoller -Operation 'Inventory'
                     }
                 }
             }
