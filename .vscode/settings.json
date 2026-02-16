@@ -1,0 +1,14 @@
+{
+    "cSpell.words": [
+        "Adctidirectory",
+        "distinguishedname",
+        "dnshostname",
+        "operatingsystem"
+    ],
+    "chat.tools.terminal.autoApprove": {
+        "/^Import-Module \"\\$PWD\\\\PS-ModuleManager\\.psd1\" -Force; Get-Command -Module PS-ModuleManager$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
