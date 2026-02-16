@@ -88,6 +88,9 @@ function Get-PSMMDefaultSettings {
         RetryCount        = 2
         ReachabilityCheck = $true
         JobTimeoutSeconds = 300
+        ExcludeServers    = $false
+        ExcludeVirtual    = $false
+        GlobalExcludeList = @()                        # e.g. @('Server1','Server2')
     }
 }
 
@@ -302,7 +305,11 @@ function Get-PSMMComputers {
         [string]$LdapPath = $script:Settings.DomainLdapPath,
         [string]$NameFilter = '*',
         [bool]$EnabledOnly = $true,
-        [bool]$TestReachability = $script:Settings.ReachabilityCheck
+        [bool]$TestReachability = $script:Settings.ReachabilityCheck,
+
+        [bool]$ExcludeServers = $script:Settings.ExcludeServers,
+
+        [bool]$ExcludeVirtual = $script:Settings.ExcludeVirtual
     )
 
     Write-PSMMLog -Severity 'INFO' -Message "Querying AD for computers (filter: $NameFilter) ..."
@@ -408,7 +415,33 @@ function Get-PSMMComputers {
         Write-PSMMLog -Severity 'INFO' -Message "Added local computer '$localName' as fallback."
     }
 
-    return $computers.ToArray()
+    # ── Post-filter: exclude servers and virtual devices ─────────────────
+    $filtered = $computers.ToArray()
+
+    if ($ExcludeServers) {
+        $before = $filtered.Count
+        $filtered = @($filtered | Where-Object { $_.OS -notmatch 'Server' })
+        $skipped = $before - $filtered.Count
+        if ($skipped -gt 0) { Write-PSMMLog -Severity 'INFO' -Message "Excluded $skipped server(s) from results." }
+    }
+
+    if ($ExcludeVirtual) {
+        $before = $filtered.Count
+        $filtered = @($filtered | Where-Object { $_.Name -notmatch 'VM-|YOURVM' -and $_.OS -notmatch 'Virtual' -and $_.OU -notmatch 'Virtual' })
+        $skipped = $before - $filtered.Count
+        if ($skipped -gt 0) { Write-PSMMLog -Severity 'INFO' -Message "Excluded $skipped virtual device(s) from results." }
+    }
+
+    # GlobalExcludeList -- always skip these computer names
+    $excludeList = $script:Settings.GlobalExcludeList
+    if ($excludeList -and $excludeList.Count -gt 0) {
+        $before = $filtered.Count
+        $filtered = @($filtered | Where-Object { $_.Name -notin $excludeList })
+        $skipped = $before - $filtered.Count
+        if ($skipped -gt 0) { Write-PSMMLog -Severity 'INFO' -Message "Excluded $skipped computer(s) via GlobalExcludeList." }
+    }
+
+    return $filtered
 }
 #endregion ADSI Service
 
@@ -1283,6 +1316,9 @@ $script:MainWindowXaml = @'
                 <TextBox Name="TxtNameFilter" Width="150" Text="*" ToolTip="Computer name wildcard (e.g. WEB*)"/>
                 <Button Name="BtnSearchAD" Content="&#x1F50D; Search AD" Margin="8,3"/>
                 <Separator Margin="10,2" Style="{x:Null}"/>
+                <CheckBox Name="ChkSkipServers" Content="Skip Servers" VerticalAlignment="Center" Margin="5,0" Foreground="#D4D4D4" ToolTip="Exclude computers with a Server OS"/>
+                <CheckBox Name="ChkSkipVirtual" Content="Skip Virtual" VerticalAlignment="Center" Margin="5,0" Foreground="#D4D4D4" ToolTip="Exclude virtual machines (Hyper-V, VMware, VirtualBox)"/>
+                <Separator Margin="10,2" Style="{x:Null}"/>
                 <Button Name="BtnCredentials" Content="&#x1F511; Credentials" Background="#4A4A4A" BorderBrush="#5A5A5A"/>
             </StackPanel>
         </Border>
@@ -1333,7 +1369,10 @@ $script:MainWindowXaml = @'
 
             <!-- ── CENTER: Module Data Grid ──────────────── -->
             <DockPanel Grid.Column="2" Grid.Row="0" Margin="5,5,5,0">
-                <TextBlock DockPanel.Dock="Top" Text="Module Inventory" FontWeight="Bold" FontSize="14" Margin="5,5" Foreground="{StaticResource AccentBlue}"/>
+                <DockPanel DockPanel.Dock="Top">
+                    <TextBlock Text="Module Inventory" FontWeight="Bold" FontSize="14" Margin="5,5" Foreground="{StaticResource AccentBlue}"/>
+                    <Button Name="BtnClearGrid" Content="Clear" HorizontalAlignment="Right" Background="#4A4A4A" BorderBrush="#5A5A5A" Margin="5,3" Padding="10,4" FontSize="11"/>
+                </DockPanel>
                 <DataGrid Name="ModuleDataGrid"
                           AutoGenerateColumns="False"
                           IsReadOnly="True"
@@ -1408,7 +1447,7 @@ $script:SettingsDialogXaml = @'
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     Title="Settings -- PS-ModuleManager"
-    Width="600" Height="660"
+    Width="600" Height="700"
     WindowStartupLocation="CenterOwner"
     ResizeMode="NoResize"
     Background="#1E1E1E"
@@ -1417,6 +1456,22 @@ $script:SettingsDialogXaml = @'
     FontSize="13">
 
     <Window.Resources>
+
+        <!-- Define a style for all ScrollBar controls within this scope -->
+        <Style TargetType="{x:Type ScrollBar}">
+            <Style.Triggers>
+                <!-- Apply properties only to the Vertical ScrollBar -->
+                <Trigger Property="Orientation" Value="Vertical">
+                    <Setter Property="MinWidth" Value="5" />
+                    <Setter Property="Width" Value="5" />
+                </Trigger>
+                <!-- Apply properties only to the Horizontal ScrollBar -->
+                <Trigger Property="Orientation" Value="Horizontal">
+                    <Setter Property="MinHeight" Value="5" />
+                    <Setter Property="Height" Value="5" />
+                </Trigger>
+            </Style.Triggers>
+        </Style>
         <Style TargetType="TextBox">
             <Setter Property="Background"  Value="#3C3C3C"/>
             <Setter Property="Foreground"  Value="#D4D4D4"/>
@@ -1573,6 +1628,10 @@ $script:SettingsDialogXaml = @'
 
                 <CheckBox Name="ChkReachability" Content="Test WinRM reachability before operations"
                           Foreground="#D4D4D4" IsChecked="True" Margin="0,8"/>
+                <CheckBox Name="ChkExcludeServers" Content="Exclude Server OS computers by default"
+                          Foreground="#D4D4D4" Margin="0,4"/>
+                <CheckBox Name="ChkExcludeVirtual" Content="Exclude virtual machines by default"
+                          Foreground="#D4D4D4" Margin="0,4"/>
             </StackPanel>
         </ScrollViewer>
 
@@ -1687,7 +1746,9 @@ function Register-PSMMMainWindowEvents {
             $listBox.Items.Clear()
 
             try {
-                $computers = Get-PSMMComputers -LdapPath $ldapPath -NameFilter $nameFilter
+                $skipServers = (Find-PSMMControl -Window $script:MainWindow -Name 'ChkSkipServers').IsChecked -eq $true
+                $skipVirtual = (Find-PSMMControl -Window $script:MainWindow -Name 'ChkSkipVirtual').IsChecked -eq $true
+                $computers = Get-PSMMComputers -LdapPath $ldapPath -NameFilter $nameFilter -ExcludeServers $skipServers -ExcludeVirtual $skipVirtual
                 $script:ComputerList.Clear()
                 foreach ($c in $computers) {
                     $script:ComputerList.Add($c)
@@ -1726,6 +1787,18 @@ function Register-PSMMMainWindowEvents {
                 Write-PSMMLog -Severity 'INFO' -Message "Starting inventory for '$modFilter' on $($selected.Count) computer(s) ..."
             } else {
                 Write-PSMMLog -Severity 'INFO' -Message "Starting inventory (all modules) on $($selected.Count) computer(s) ..."
+            }
+
+            # Clear previous inventory rows for the selected computers to avoid duplicates
+            $grid = Find-PSMMControl -Window $script:MainWindow -Name 'ModuleDataGrid'
+            if ($grid) {
+                $toRemove = @()
+                foreach ($item in $grid.Items) {
+                    if ($item -is [PSCustomObject] -and $selected -contains $item.ComputerName) {
+                        $toRemove += $item
+                    }
+                }
+                foreach ($item in $toRemove) { $grid.Items.Remove($item) }
             }
 
             # Launch async inventory -- filtered to the selected module if one is chosen
@@ -1831,6 +1904,13 @@ function Register-PSMMMainWindowEvents {
     $btnDeselectAll.Add_Click({
             $listBox = Find-PSMMControl -Window $script:MainWindow -Name 'ComputerListBox'
             $listBox.UnselectAll()
+        })
+
+    # ── Clear Module Grid ────────────────────────────────────────────────────
+    $btnClearGrid = Find-PSMMControl -Window $Window -Name 'BtnClearGrid'
+    $btnClearGrid.Add_Click({
+            $grid = Find-PSMMControl -Window $script:MainWindow -Name 'ModuleDataGrid'
+            $grid.Items.Clear()
         })
 
     # ── Export Log ───────────────────────────────────────────────────────────
@@ -1996,10 +2076,12 @@ function Start-PSMMJobPoller {
                 if ($job.Result) {
                     foreach ($result in $job.Result) {
                         if ($result -is [PSCustomObject] -and $result.PSObject.Properties['ModuleName']) {
+                            # Skip error marker rows
+                            if ($result.ModuleName -eq '_ERROR_') { continue }
+
                             # Inventory result -- add to grid
                             $grid = Find-PSMMControl -Window $script:MainWindow -Name 'ModuleDataGrid'
                             if ($grid) {
-                                # Add to ItemsSource or Items
                                 $grid.Items.Add([PSCustomObject]@{
                                         ComputerName     = $result.ComputerName
                                         ModuleName       = $result.ModuleName
@@ -2146,8 +2228,10 @@ function Show-PSMMSettingsDialog {
     $txtTimeout      = $settingsWin.FindName('TxtSettTimeout')
     $credCombo       = $settingsWin.FindName('CmbSettCredMode')
     $logCombo        = $settingsWin.FindName('CmbSettLogLevel')
-    $chkReachability = $settingsWin.FindName('ChkReachability')
-    $btnSave         = $settingsWin.FindName('BtnSettSave')
+    $chkReachability   = $settingsWin.FindName('ChkReachability')
+    $chkExclServers    = $settingsWin.FindName('ChkExcludeServers')
+    $chkExclVirtual    = $settingsWin.FindName('ChkExcludeVirtual')
+    $btnSave           = $settingsWin.FindName('BtnSettSave')
     $btnCancel       = $settingsWin.FindName('BtnSettCancel')
     $btnTestShare    = $settingsWin.FindName('BtnTestShare')
     $btnTestAD       = $settingsWin.FindName('BtnTestAD')
@@ -2184,6 +2268,8 @@ function Show-PSMMSettingsDialog {
     }
 
     $chkReachability.IsChecked = [bool]$script:Settings.ReachabilityCheck
+    $chkExclServers.IsChecked    = [bool]$script:Settings.ExcludeServers
+    $chkExclVirtual.IsChecked    = [bool]$script:Settings.ExcludeVirtual
 
     # Capture module-scoped references as local variables so .GetNewClosure() can see them
     $settings        = $script:Settings          # hashtable reference -- mutations propagate
@@ -2211,6 +2297,8 @@ function Show-PSMMSettingsDialog {
             if ($logSel) { $settings['LogLevel'] = $logSel.Content.ToString() }
 
             $settings['ReachabilityCheck'] = [bool]$chkReachability.IsChecked
+            $settings['ExcludeServers']    = [bool]$chkExclServers.IsChecked
+            $settings['ExcludeVirtual']    = [bool]$chkExclVirtual.IsChecked
 
             # Validate
             $issues = & $fnTestSettings -Settings $settings
@@ -2320,6 +2408,12 @@ function Show-ModuleManagerGUI {
 
     Write-Host 'Starting PS-ModuleManager ...' -ForegroundColor Cyan
 
+    # ── Admin check ───────────────────────────────────────────────────────────
+    $script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $script:IsAdmin) {
+        Write-Host 'WARNING: Not running as Administrator. Install/Update/Remove operations will fail for system-wide module paths.' -ForegroundColor Yellow
+    }
+
     # ── Load settings ────────────────────────────────────────────────────────
     $script:SettingsPath = $SettingsPath
     Import-PSMMSettings -Path $SettingsPath
@@ -2341,6 +2435,12 @@ function Show-ModuleManagerGUI {
         $ouBox.Text = $script:Settings.OuFilter
     }
 
+    # Set toolbar checkboxes from saved settings
+    $chkSkipSrv = Find-PSMMControl -Window $script:MainWindow -Name 'ChkSkipServers'
+    if ($chkSkipSrv) { $chkSkipSrv.IsChecked = [bool]$script:Settings.ExcludeServers }
+    $chkSkipVm = Find-PSMMControl -Window $script:MainWindow -Name 'ChkSkipVirtual'
+    if ($chkSkipVm) { $chkSkipVm.IsChecked = [bool]$script:Settings.ExcludeVirtual }
+
     # ── Wire event handlers ──────────────────────────────────────────────────
     Register-PSMMMainWindowEvents -Window $script:MainWindow
 
@@ -2349,6 +2449,10 @@ function Show-ModuleManagerGUI {
     Write-PSMMLog -Severity 'INFO' -Message "Settings loaded from: $SettingsPath"
     Write-PSMMLog -Severity 'INFO' -Message "Central share: $($script:Settings.CentralSharePath)"
     Write-PSMMLog -Severity 'INFO' -Message "Concurrency: $($script:Settings.MaxConcurrency) threads"
+
+    if (-not $script:IsAdmin) {
+        Write-PSMMLog -Severity 'WARN' -Message 'Not running as Administrator -- install/update/remove to system-wide module paths will require elevation.'
+    }
 
     # ── Ensure window is topmost ───────────────────────────────────────────
     $script:MainWindow.Topmost = $true
