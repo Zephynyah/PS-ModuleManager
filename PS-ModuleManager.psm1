@@ -1210,8 +1210,9 @@ function Install-PSMMModule {
     $installScript = {
         param($Computer, $Cred, $ModName, $Ver, $Source)
         try {
+            # Scriptblock that runs locally on the target machine using a local staging path
             $innerSb = {
-                param($ModName, $Ver, $Source)
+                param($ModName, $Ver, $StagingPath)
                 $destRoot = Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'
                 $destPath = Join-Path $destRoot "$ModName\$Ver"
 
@@ -1219,13 +1220,35 @@ function Install-PSMMModule {
                     New-Item -ItemType Directory -Path $destPath -Force | Out-Null
                 }
 
-                # Check for ZIP or folder
-                $zipFile = Get-ChildItem -LiteralPath $Source -Filter '*.zip' -ErrorAction SilentlyContinue | Select-Object -First 1
+                # Check for ZIP or folder in the local staging path
+                $zipFile = Get-ChildItem -LiteralPath $StagingPath -Filter '*.zip' -ErrorAction SilentlyContinue | Select-Object -First 1
                 if ($zipFile) {
-                    Expand-Archive -LiteralPath $zipFile.FullName -DestinationPath $destPath -Force
+                    # Extract to a temp directory first to handle ZIPs with a wrapper folder
+                    $tempExtract = Join-Path $env:TEMP "PSMMExtract_$ModName_$Ver_$([guid]::NewGuid().ToString('N'))"
+                    New-Item -ItemType Directory -Path $tempExtract -Force | Out-Null
+                    try {
+                        Add-Type -AssemblyName System.IO.Compression.FileSystem
+                        [System.IO.Compression.ZipFile]::ExtractToDirectory($zipFile.FullName, $tempExtract)
+
+                        # Detect wrapper folder: if extraction produced a single subfolder and no files at root, unwrap it
+                        $extractedDirs  = Get-ChildItem -LiteralPath $tempExtract -Directory -ErrorAction SilentlyContinue
+                        $extractedFiles = Get-ChildItem -LiteralPath $tempExtract -File -ErrorAction SilentlyContinue
+                        if ($extractedDirs.Count -eq 1 -and $extractedFiles.Count -eq 0) {
+                            # Single wrapper folder -- copy its contents directly into destination
+                            Copy-Item -Path (Join-Path $extractedDirs[0].FullName '*') -Destination $destPath -Recurse -Force
+                        }
+                        else {
+                            # No wrapper -- copy everything as-is
+                            Copy-Item -Path "$tempExtract\*" -Destination $destPath -Recurse -Force
+                        }
+                    }
+                    finally {
+                        Remove-Item -LiteralPath $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
+                    }
                 }
                 else {
-                    Copy-Item -Path "$Source\*" -Destination $destPath -Recurse -Force
+                    # Folder-based: copy loose module files directly
+                    Copy-Item -Path "$StagingPath\*" -Destination $destPath -Recurse -Force
                 }
 
                 # Validate
@@ -1240,16 +1263,38 @@ function Install-PSMMModule {
 
             $isLocal = ($Computer -eq $env:COMPUTERNAME) -or ($Computer -eq 'localhost') -or ($Computer -eq '.')
             if ($isLocal) {
+                # Local install -- source is directly accessible
                 & $innerSb $ModName $Ver $Source
-            } else {
-                $splat = @{
-                    ComputerName = $Computer
-                    ErrorAction  = 'Stop'
-                    ScriptBlock  = $innerSb
-                    ArgumentList = @($ModName, $Ver, $Source)
+            }
+            else {
+                # Remote install -- stage source files onto the remote PC first to avoid double-hop
+                $session = $null
+                try {
+                    $sessionSplat = @{ ComputerName = $Computer; ErrorAction = 'Stop' }
+                    if ($Cred) { $sessionSplat['Credential'] = $Cred }
+                    $session = New-PSSession @sessionSplat
+
+                    # Create a temp staging directory on the remote machine
+                    $remoteStagingPath = Invoke-Command -Session $session -ScriptBlock {
+                        $p = Join-Path $env:TEMP "PSMMStaging_$([guid]::NewGuid().ToString('N'))"
+                        New-Item -ItemType Directory -Path $p -Force | ForEach-Object { $_.FullName }
+                    }
+
+                    # Copy source files from the share to the remote staging directory
+                    Copy-Item -Path "$Source\*" -Destination $remoteStagingPath -ToSession $session -Recurse -Force
+
+                    # Run the install logic using the local staging path (no double-hop)
+                    Invoke-Command -Session $session -ScriptBlock $innerSb -ArgumentList @($ModName, $Ver, $remoteStagingPath)
+
+                    # Clean up staging directory on remote machine
+                    Invoke-Command -Session $session -ScriptBlock {
+                        param($p)
+                        Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue
+                    } -ArgumentList @($remoteStagingPath)
                 }
-                if ($Cred) { $splat['Credential'] = $Cred }
-                Invoke-Command @splat
+                finally {
+                    if ($session) { Remove-PSSession -Session $session -ErrorAction SilentlyContinue }
+                }
             }
         }
         catch {
@@ -2440,7 +2485,7 @@ function Register-PSMMMainWindowEvents {
                 $dlg.Title = 'Export Module Inventory'
                 $dlg.Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'
                 $dlg.FileName = "ModuleInventory_$(Get-Date -Format 'yyyy-MM-dd_HHmmss').csv"
-                if ($dlg.ShowDialog()) {
+                if ($dlg.ShowDialog($script:MainWindow)) {
                     $rows = foreach ($item in $script:ModuleGrid) {
                         [PSCustomObject]@{
                             ComputerName     = $item.ComputerName
@@ -2471,7 +2516,7 @@ function Register-PSMMMainWindowEvents {
             $dlg.Title = 'Export Log'
             $dlg.Filter = 'Log files (*.log)|*.log|Text files (*.txt)|*.txt|All files (*.*)|*.*'
             $dlg.FileName = "PS-ModuleManager_$(Get-Date -Format 'yyyy-MM-dd_HHmmss').log"
-            if ($dlg.ShowDialog()) {
+            if ($dlg.ShowDialog($script:MainWindow)) {
                 try {
                     $logBox.Items | Out-File -FilePath $dlg.FileName -Encoding UTF8
                     Write-PSMMLog -Severity 'INFO' -Message "Log exported to $($dlg.FileName)"
@@ -3007,7 +3052,7 @@ function Show-PSMMSettingsDialog {
             $dlg = [Microsoft.Win32.OpenFileDialog]::new()
             $dlg.Title  = 'Import Settings'
             $dlg.Filter = 'JSON files (*.json)|*.json|All files (*.*)|*.*'
-            if ($dlg.ShowDialog()) {
+            if ($dlg.ShowDialog($settingsWin)) {
                 try {
                     $imported = & $fnImportSettings -Path $dlg.FileName
                     if (-not $imported) {
@@ -3059,7 +3104,7 @@ function Show-PSMMSettingsDialog {
             $dlg.Title    = 'Export Settings'
             $dlg.Filter   = 'JSON files (*.json)|*.json|All files (*.*)|*.*'
             $dlg.FileName = "PS-ModuleManager-Settings_$(Get-Date -Format 'yyyy-MM-dd').json"
-            if ($dlg.ShowDialog()) {
+            if ($dlg.ShowDialog($settingsWin)) {
                 try {
                     & $fnExportSettings -Settings $settings -Path $dlg.FileName
                     & $fnWriteLog -Severity 'INFO' -Message "Settings exported to $($dlg.FileName)"
