@@ -36,14 +36,14 @@ The `.psm1` is organized into `#region` / `#endregion` blocks in this order:
 #region Assembly Loading
 #region Script-Scoped State
 #region Configuration          -- Get-PSMMDefaultSettings, Import/Export/Test-PSMMSettings
-#region Logging                -- Write-PSMMLog
-#region ADSI Service           -- Get-PSMMComputers
+#region Logging                -- Write-PSMMLog, Invoke-PSMMLogRotation
+#region ADSI Service           -- ConvertTo-PSMMLdapSafeString, Get-PSMMComputers
 #region Runspace Pool          -- New-PSMMRunspacePool, Invoke-PSMMParallel, Receive/Stop/Close
 #region Module Inventory       -- Get-PSMMRemoteModules, Get-PSMMShareModules, Compare-PSMMModuleVersions
-#region Module Deployment      -- Install-PSMMModule, Uninstall-PSMMModule
+#region Module Deployment      -- Get-PSMMModuleDependencies, Install-PSMMModule, Uninstall-PSMMModule
 #region Credential Management  -- Get-PSMMCredential
 #region WPF XAML Definition    -- inline XAML here-strings (main window + settings dialog)
-#region WPF Helpers            -- New-PSMMWindow, Find-PSMMControl, Update-PSMMDispatcher
+#region WPF Helpers            -- New-PSMMWindow, Find-PSMMControl, Update-PSMMDispatcher, Invoke-PSMMSafeAction
 #region WPF Event Handlers     -- Register-PSMMMainWindowEvents
 #region Job Poller             -- Start-PSMMJobPoller (DispatcherTimer)
 #region ADSI Helper            -- Get-ADSIInfo
@@ -169,31 +169,31 @@ PS-ModuleManager/
 
 The following enhancements would improve reliability, maintainability, and user experience. Prioritized by impact.
 
-### High Priority
+### High Priority (all implemented)
 
-1. **Pester test suite** -- Add `test/PS-ModuleManager.Tests.ps1` with unit tests for all non-WPF functions (`Get-PSMMDefaultSettings`, `Import-PSMMSettings`, `Test-PSMMSettings`, `Compare-PSMMModuleVersions`, `Get-PSMMShareModules`). Mock remote calls with `Invoke-Command` stubs. Target 80%+ coverage of business logic.
+1. **Pester test suite** -- DONE. `test/PS-ModuleManager.Tests.ps1` with unit tests for `Get-PSMMDefaultSettings`, `Import-PSMMSettings`, `Test-PSMMSettings`, `Compare-PSMMModuleVersions`, `Get-PSMMShareModules`, `ConvertTo-PSMMLdapSafeString`.
 
-2. **Input validation and sanitization** -- Harden `Get-PSMMComputers` against LDAP injection in the search/OU filter fields. Escape special LDAP characters (`*`, `(`, `)`, `\`, NUL) in user-provided wildcard strings before building the DirectorySearcher filter.
+2. **Input validation and sanitization** -- DONE. `ConvertTo-PSMMLdapSafeString` escapes special LDAP characters in user-provided filters before building the `DirectorySearcher` filter.
 
-3. **Graceful error recovery in UI** -- Add a global `try/catch` around event handlers in `Register-PSMMMainWindowEvents` so that an unhandled exception shows a WPF `MessageBox` with the error instead of silently crashing or freezing the window.
+3. **Graceful error recovery in UI** -- DONE. `Invoke-PSMMSafeAction` wraps event handlers with `try/catch` and shows a `MessageBox` on unhandled exceptions. Enhanced confirmation dialogs for all destructive actions.
 
-4. **Progress indication** -- Add a `ProgressBar` control (indeterminate mode) to the status bar that activates during long-running operations (inventory scan, install/update/remove). Currently the user has no visual feedback beyond log entries.
+4. **Progress indication** -- DONE. Indeterminate `ProgressBar` (`StatusProgress`) in the status bar, activated by `Start-PSMMJobPoller` and hidden when all jobs complete.
 
-5. **Export inventory to CSV** -- Add an "Export" button/menu item that writes the current `ModuleDataGrid` contents to a CSV file via `Export-Csv`. This is frequently requested for audit and compliance reporting.
+5. **Export inventory to CSV** -- DONE. `BtnExportCsv` button with `SaveFileDialog` exports `ModuleDataGrid` contents via `Export-Csv`.
 
-### Medium Priority
+### Medium Priority (all implemented)
 
-6. **Module dependency awareness** -- Before installing/updating a module, check its `.psd1` manifest for `RequiredModules` and warn (or auto-install) if dependencies are missing on the target computer.
+6. **Module dependency awareness** -- DONE. `Get-PSMMModuleDependencies` reads `.psd1` manifests for `RequiredModules` and logs warnings before install.
 
-7. **Bulk select/deselect computers** -- Add "Select All" / "Deselect All" / "Invert Selection" buttons or context menu items to the computer list panel. Currently users must click each checkbox individually.
+7. **Bulk select/deselect computers** -- DONE. "Select All", "Deselect All", and "Invert Selection" buttons in the computer list panel.
 
-8. **Confirmation dialogs for destructive actions** -- Show a confirmation dialog with the list of affected computers and modules before Install/Update/Remove operations. Currently only Remove has a confirm prompt.
+8. **Confirmation dialogs for destructive actions** -- DONE. All Install/Update/Remove operations show confirmation dialogs listing affected computers and modules.
 
-9. **Settings import/export** -- Add UI buttons to export the current `settings.json` to a chosen path and import from an external file. Useful for deploying consistent configuration across multiple admin workstations.
+9. **Settings import/export** -- DONE. Import/Export buttons in the Settings dialog with `OpenFileDialog`/`SaveFileDialog` for external JSON files.
 
-10. **Log rotation** -- Implement automatic log rotation (e.g., keep last 30 days or 10 MB). Currently log files grow without bound in the `logs/` directory.
+10. **Log rotation** -- DONE. `Invoke-PSMMLogRotation` removes files older than 30 days and enforces a 10 MB total size cap. Runs automatically on GUI startup.
 
-11. **Keyboard shortcuts** -- Add accelerator keys for common actions: `Ctrl+R` = Refresh inventory, `Ctrl+S` = Settings, `Ctrl+E` = Export, `Escape` = Cancel running jobs.
+11. **Keyboard shortcuts** -- DONE. `Ctrl+R` = Inventory refresh, `Ctrl+S` = Settings, `Ctrl+E` = Export CSV, `Escape` = Cancel running jobs. Implemented via `PreviewKeyDown` on the main window.
 
 ### Low Priority / Future
 

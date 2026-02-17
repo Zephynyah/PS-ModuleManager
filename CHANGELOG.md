@@ -25,6 +25,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - `.editorconfig` for consistent coding styles
 - `.gitattributes` for LF normalization
 - Test scripts in `test/` directory
+- Pester v5 test suite (`test/PS-ModuleManager.Tests.ps1`) covering non-WPF business logic
+- `ConvertTo-PSMMLdapSafeString` for LDAP injection protection in search filters
+- `Invoke-PSMMSafeAction` wrapper for graceful error recovery in WPF event handlers
+- Indeterminate `ProgressBar` in status bar during long-running operations
+- Export inventory to CSV button (`BtnExportCsv`) with `SaveFileDialog`
+- `Get-PSMMModuleDependencies` for `.psd1` manifest `RequiredModules` checking before install
+- Dependency warnings logged during `Install-PSMMModule` when `RequiredModules` are detected
+- "Invert Selection" button for bulk computer selection toggling
+- Settings import/export buttons in the Settings dialog (load from / save to external JSON)
+- `Invoke-PSMMLogRotation` for automatic log file cleanup (30-day retention, 10 MB cap)
+- Log rotation runs automatically on GUI startup
+- Keyboard shortcuts: `Ctrl+R` (Inventory), `Ctrl+S` (Settings), `Ctrl+E` (Export CSV), `Escape` (Cancel jobs)
+- Enhanced confirmation dialogs for Install/Update/Remove with detailed computer and module lists
+- `.github/copilot-instructions.md` with coding standards and improvement roadmap
 
 ### Changed
 
