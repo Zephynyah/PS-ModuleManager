@@ -179,6 +179,7 @@ PS-ModuleManager.psm1            <-- everything lives here
 | `scripts/Create-Shortcut.ps1` | Creates a desktop shortcut to launch PS-ModuleManager. |
 | `scripts/Get-ADSIInfo.ps1` | Standalone script to discover domain LDAP path and OUs. |
 | `test/` | Test scripts for development and validation. |
+| `.github/copilot-instructions.md` | GitHub Copilot custom instructions with coding standards and improvement recommendations. |
 
 ---
 

@@ -97,6 +97,8 @@ PS-ModuleManager/
 +-- CHANGELOG.md              # Project changelog
 +-- README.md
 +-- LICENSE
++-- .github/
+|   +-- copilot-instructions.md  # GitHub Copilot custom instructions
 +-- docs/
 |   +-- PLAN.md               # Detailed project plan & architecture
 +-- scripts/
