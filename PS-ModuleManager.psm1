@@ -34,17 +34,54 @@ Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms   # for FolderBrowserDialog fallback
 
-# ── Define a WPF-friendly data class for the Module Inventory grid ────────────
-Add-Type -TypeDefinition @"
+# ── Define WPF-friendly data classes with INotifyPropertyChanged ──────────────
+if (-not ([System.Management.Automation.PSTypeName]'ComputerItem').Type) {
+    Add-Type -TypeDefinition @"
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
 
+/// <summary>Data item for the Computer list (left panel) with checkbox + status.</summary>
+public class ComputerItem : INotifyPropertyChanged {
+    private bool   _isSelected;
+    private string _name;
+    private string _connectionStatus;   // "Local" | "WinRM" | "Unreachable"
+
+    public bool IsSelected {
+        get { return _isSelected; }
+        set { _isSelected = value; OnPropertyChanged(); }
+    }
+    public string Name {
+        get { return _name; }
+        set { _name = value; OnPropertyChanged(); }
+    }
+    public string ConnectionStatus {
+        get { return _connectionStatus; }
+        set { _connectionStatus = value; OnPropertyChanged(); }
+    }
+
+    public event PropertyChangedEventHandler PropertyChanged;
+    protected void OnPropertyChanged([CallerMemberName] string name = null) {
+        var handler = PropertyChanged;
+        if (handler != null) handler(this, new PropertyChangedEventArgs(name));
+    }
+}
+"@
+}
+
+if (-not ([System.Management.Automation.PSTypeName]'ModuleGridItem').Type) {
+    Add-Type -TypeDefinition @"
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
+
+/// <summary>Data item for the Module Inventory grid (center panel).</summary>
 public class ModuleGridItem : INotifyPropertyChanged {
     private string _computerName;
     private string _moduleName;
     private string _installedVersion;
     private string _targetVersion;
     private string _status;
+    private string _model;
+    private string _os;
 
     public string ComputerName {
         get { return _computerName; }
@@ -66,13 +103,23 @@ public class ModuleGridItem : INotifyPropertyChanged {
         get { return _status; }
         set { _status = value; OnPropertyChanged(); }
     }
+    public string Model {
+        get { return _model; }
+        set { _model = value; OnPropertyChanged(); }
+    }
+    public string OS {
+        get { return _os; }
+        set { _os = value; OnPropertyChanged(); }
+    }
 
     public event PropertyChangedEventHandler PropertyChanged;
     protected void OnPropertyChanged([CallerMemberName] string name = null) {
-        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+        var handler = PropertyChanged;
+        if (handler != null) handler(this, new PropertyChangedEventArgs(name));
     }
 }
 "@
+}
 #endregion Assembly Loading
 
 
@@ -95,7 +142,7 @@ $script:Jobs = [System.Collections.ArrayList]::new()   # active async jobs
 $script:LogEntries = [System.Collections.ArrayList]::new()   # in-memory log buffer
 $script:Credential = $null   # [PSCredential] when using Prompt/Stored mode
 $script:MainWindow = $null   # WPF Window reference
-$script:ComputerList = [System.Collections.ObjectModel.ObservableCollection[PSObject]]::new()
+$script:ComputerList = [System.Collections.ObjectModel.ObservableCollection[ComputerItem]]::new()
 $script:ModuleGrid = [System.Collections.ObjectModel.ObservableCollection[ModuleGridItem]]::new()
 $script:JobQueue = [System.Collections.ObjectModel.ObservableCollection[PSObject]]::new()
 $script:JobPollerTimer = $null   # active DispatcherTimer for job polling
@@ -434,7 +481,9 @@ function Get-PSMMComputers {
         # Fallback: add the local computer so the tool remains usable off-domain
         $localName = $env:COMPUTERNAME
         $localDns  = try { [System.Net.Dns]::GetHostEntry('').HostName } catch { $localName }
-        $localOS   = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
+        $ComputerSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
+        $localOS   = $ComputerSystem.Caption
+        $localModel = $ComputerSystem.Model
 
         $reachable = $null
         if ($TestReachability) {
@@ -451,6 +500,7 @@ function Get-PSMMComputers {
                 OU          = ''
                 Enabled     = $true
                 OS          = $localOS
+                Model       = $localModel
                 Reachable   = $reachable
             })
 
@@ -745,15 +795,34 @@ function Get-PSMMRemoteModules {
                 $sb = { Get-Module -ListAvailable | Select-Object Name, @{N = 'Version'; E = { $_.Version.ToString() } }, ModuleBase }
             }
 
+            # Gather Model and OS info
+            $sysInfoSb = {
+                $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
+                $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
+                [PSCustomObject]@{
+                    Model = if ($cs) { $cs.Model } else { '' }
+                    OS    = if ($os) { $os.Caption } else { '' }
+                }
+            }
+
             $isLocal = ($Computer -eq $env:COMPUTERNAME) -or ($Computer -eq 'localhost') -or ($Computer -eq '.')
             if ($isLocal) {
                 # Run locally -- no WinRM needed
-                $modules = & $sb
+                $modules  = & $sb
+                $sysInfo  = & $sysInfoSb
             } else {
                 $splat = @{ ComputerName = $Computer; ScriptBlock = $sb }
                 if ($Cred) { $splat['Credential'] = $Cred }
                 $modules = Invoke-Command @splat -ErrorAction Stop
+
+                $splatSys = @{ ComputerName = $Computer; ScriptBlock = $sysInfoSb }
+                if ($Cred) { $splatSys['Credential'] = $Cred }
+                $sysInfo = Invoke-Command @splatSys -ErrorAction SilentlyContinue
             }
+
+            $model = if ($sysInfo) { $sysInfo.Model } else { '' }
+            $osCaption = if ($sysInfo) { $sysInfo.OS } else { '' }
+
             if ($ModFilter -and -not $modules) {
                 # Module not found on remote computer -- return explicit 'Not Installed' entry
                 [PSCustomObject]@{
@@ -761,6 +830,8 @@ function Get-PSMMRemoteModules {
                     ModuleName       = $ModFilter
                     InstalledVersion = ''
                     ModuleBase       = ''
+                    Model            = $model
+                    OS               = $osCaption
                 }
             } else {
                 foreach ($m in $modules) {
@@ -769,6 +840,8 @@ function Get-PSMMRemoteModules {
                         ModuleName       = $m.Name
                         InstalledVersion = $m.Version
                         ModuleBase       = $m.ModuleBase
+                        Model            = $model
+                        OS               = $osCaption
                     }
                 }
             }
@@ -779,6 +852,8 @@ function Get-PSMMRemoteModules {
                 ModuleName       = '_ERROR_'
                 InstalledVersion = ''
                 ModuleBase       = $_.ToString()
+                Model            = ''
+                OS               = ''
             }
         }
     }
@@ -885,6 +960,8 @@ function Compare-PSMMModuleVersions {
             InstalledVersion = $mod.InstalledVersion
             TargetVersion    = $target
             Status           = $status
+            Model            = $mod.Model
+            OS               = $mod.OS
         }
     }
 
@@ -1328,6 +1405,48 @@ $script:MainWindowXaml = @'
                 </Setter.Value>
             </Setter>
         </Style>
+
+        <!-- Style for the Border Background -->
+        <Style x:Key="ServersPillBorderStyle" TargetType="Border">
+            <Setter Property="Background" Value="#007ACC" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsChecked, ElementName=ChkSkipServers}" Value="True">
+                    <Setter Property="Background" Value="#444444" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <!-- Style for the TextBlock Content -->
+        <Style x:Key="ServersPillTextStyle" TargetType="TextBlock">
+            <Setter Property="Text" Value="Servers Included" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsChecked, ElementName=ChkSkipServers}" Value="True">
+                    <Setter Property="Text" Value="Servers Skipped" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <!-- Style for the Border Background -->
+        <Style x:Key="VirtualPillBorderStyle" TargetType="Border">
+            <Setter Property="Background" Value="#007ACC" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsChecked, ElementName=ChkSkipVirtual}" Value="True">
+                    <Setter Property="Background" Value="#444444" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <!-- Style for the TextBlock Content -->
+        <Style x:Key="VirtualPillTextStyle" TargetType="TextBlock">
+            <Setter Property="Text" Value="VMs Included" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsChecked, ElementName=ChkSkipVirtual}" Value="True">
+                    <Setter Property="Text" Value="VMs Skipped" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+
     </Window.Resources>
 
     <DockPanel>
@@ -1351,18 +1470,94 @@ $script:MainWindowXaml = @'
 
         <!-- ══════════════════ TOOLBAR ═══════════════════ -->
         <Border DockPanel.Dock="Top" Background="#252526" Padding="5,4" BorderBrush="#3C3C3C" BorderThickness="0,0,0,1">
-            <StackPanel Orientation="Horizontal">
-                <TextBlock Text="OU Filter:" VerticalAlignment="Center" Margin="5,0"/>
-                <TextBox Name="TxtOuFilter" Width="250" ToolTip="LDAP path or OU filter (e.g. OU=Servers,DC=corp,DC=local)"/>
-                <TextBlock Text="Name:" VerticalAlignment="Center" Margin="10,0,5,0"/>
-                <TextBox Name="TxtNameFilter" Width="150" Text="*" ToolTip="Computer name wildcard (e.g. WEB*)"/>
-                <Button Name="BtnSearchAD" Content="&#x1F50D; Search AD" Margin="8,3"/>
-                <Separator Margin="10,2" Style="{x:Null}"/>
-                <CheckBox Name="ChkSkipServers" Content="Skip Servers" VerticalAlignment="Center" Margin="5,0" Foreground="#D4D4D4" ToolTip="Exclude computers with a Server OS"/>
-                <CheckBox Name="ChkSkipVirtual" Content="Skip Virtual" VerticalAlignment="Center" Margin="5,0" Foreground="#D4D4D4" ToolTip="Exclude virtual machines (Hyper-V, VMware, VirtualBox)"/>
-                <Separator Margin="10,2" Style="{x:Null}"/>
-                <Button Name="BtnCredentials" Content="&#x1F511; Credentials" Background="#4A4A4A" BorderBrush="#5A5A5A"/>
-            </StackPanel>
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0" Orientation="Horizontal">
+                    <TextBlock Text="OU Filter:" VerticalAlignment="Center" Margin="5,0"/>
+                    <TextBox Name="TxtOuFilter" Width="250" ToolTip="LDAP path or OU filter (e.g. OU=Servers,DC=corp,DC=local)"/>
+                    <TextBlock Text="Name:" VerticalAlignment="Center" Margin="10,0,5,0"/>
+                    <TextBox Name="TxtNameFilter" Width="150" Text="*" ToolTip="Computer name wildcard (e.g. WEB*)"/>
+                    <Button Name="BtnSearchAD" Content="&#x1F50D; Search AD" Margin="8,3"/>
+                    <Separator Margin="10,2" Style="{x:Null}"/>
+                    <Separator Margin="10,2" Style="{x:Null}"/>
+                    <Button Name="BtnCredentials" Content="&#x1F511; Credentials" Background="#4A4A4A" BorderBrush="#5A5A5A"/>
+                </StackPanel>
+
+                <StackPanel Grid.Column="2" Orientation="Horizontal" Margin="20,0,5,0" >
+                    <!-- Skip Servers CheckBox (hidden, drives pill state) -->
+                    <CheckBox Name="ChkSkipServers" Visibility="Collapsed" />
+
+                    <!-- Skip Servers Pill -->
+                    <Border Margin="20,0,5,0" Height="30" CornerRadius="15" Padding="12,0" Cursor="Hand"
+                            ToolTip="Include/Exclude computers with a Server OS in settings">
+                        <Border.Style>
+                            <Style TargetType="Border">
+                                <Setter Property="Background" Value="#007ACC" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding ElementName=ChkSkipServers, Path=IsChecked}" Value="True">
+                                        <Setter Property="Background" Value="#444444" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Border.Style>
+
+        
+                        <!-- Label text -->
+                        <TextBlock VerticalAlignment="Center" Foreground="White" FontSize="12">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Text" Value="&#x2714; Servers" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding ElementName=ChkSkipServers, Path=IsChecked}" Value="True">
+                                            <Setter Property="Text" Value="&#x2718; Servers" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                
+                    </Border>
+                </StackPanel>
+
+                <StackPanel Grid.Column="3" Orientation="Horizontal" Margin="0,0">
+                    <!-- Skip Virtual CheckBox (hidden, drives pill state) -->
+                    <CheckBox Name="ChkSkipVirtual" Visibility="Collapsed" />
+
+                    <!-- Skip Virtual Pill -->
+                    <Border Margin="20,0,5,0" Height="30" CornerRadius="15" Padding="12,0" Cursor="Hand" ToolTip="Include/Exclude virtual machines in settings">
+                        <Border.Style>
+                            <Style TargetType="Border">
+                                <Setter Property="Background" Value="#007ACC" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding ElementName=ChkSkipVirtual, Path=IsChecked}" Value="True">
+                                        <Setter Property="Background" Value="#444444" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Border.Style>
+             
+                        <!-- Label text -->
+                        <TextBlock VerticalAlignment="Center" Foreground="White" FontSize="12">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Text" Value="&#x2714; VMs" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding ElementName=ChkSkipVirtual, Path=IsChecked}" Value="True">
+                                            <Setter Property="Text" Value="&#x2718; VMs" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                    </Border>
+                </StackPanel>
+
+            </Grid>
         </Border>
 
         <!-- ══════════════════ STATUS BAR ════════════════ -->
@@ -1400,9 +1595,23 @@ $script:MainWindowXaml = @'
                     </StackPanel>
                     <ListBox Name="ComputerListBox"
                              Margin="5"
-                             SelectionMode="Extended"
                              Background="#1E1E1E"
-                             BorderThickness="0"/>
+                             BorderThickness="0"
+                             ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <DockPanel Margin="2,1">
+                                    <CheckBox IsChecked="{Binding IsSelected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                              VerticalAlignment="Center" Margin="0,0,6,0"/>
+                                    <TextBlock Text="{Binding ConnectionStatus}" FontSize="10" Foreground="#888888"
+                                               VerticalAlignment="Center" DockPanel.Dock="Right" Margin="6,0,2,0"
+                                               MinWidth="42" TextAlignment="Right"/>
+                                    <TextBlock Text="{Binding Name}" Foreground="#D4D4D4" VerticalAlignment="Center"
+                                               TextTrimming="CharacterEllipsis"/>
+                                </DockPanel>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
                 </DockPanel>
             </Border>
 
@@ -1422,11 +1631,13 @@ $script:MainWindowXaml = @'
                           CanUserSortColumns="True"
                           Margin="0,5,0,0">
                     <DataGrid.Columns>
-                        <DataGridTextColumn Header="Computer"          Binding="{Binding ComputerName}"     Width="140"/>
-                        <DataGridTextColumn Header="Module"            Binding="{Binding ModuleName}"       Width="180"/>
-                        <DataGridTextColumn Header="Installed"         Binding="{Binding InstalledVersion}" Width="100"/>
-                        <DataGridTextColumn Header="Available"         Binding="{Binding TargetVersion}"    Width="100"/>
-                        <DataGridTextColumn Header="Status"            Binding="{Binding Status}"           Width="100"/>
+                        <DataGridTextColumn Header="Computer"          Binding="{Binding ComputerName}"     Width="2*"/>
+                        <DataGridTextColumn Header="Model"             Binding="{Binding Model}"            Width="2*"/>
+                        <DataGridTextColumn Header="OS"                Binding="{Binding OS}"               Width="4*"/>
+                        <DataGridTextColumn Header="Module"            Binding="{Binding ModuleName}"       Width="3*"/>
+                        <DataGridTextColumn Header="Installed"         Binding="{Binding InstalledVersion}" Width="2*"/>
+                        <DataGridTextColumn Header="Available"         Binding="{Binding TargetVersion}"    Width="2*"/>
+                        <DataGridTextColumn Header="Status"            Binding="{Binding Status}"           Width="2*"/>
                     </DataGrid.Columns>
                 </DataGrid>
             </DockPanel>
@@ -1783,19 +1994,37 @@ function Register-PSMMMainWindowEvents {
 
             Write-PSMMLog -Severity 'INFO' -Message "Searching AD: OU=$ouFilter, Name=$nameFilter"
 
-            $listBox = Find-PSMMControl -Window $script:MainWindow -Name 'ComputerListBox'
-            $listBox.Items.Clear()
-
             try {
                 $skipServers = (Find-PSMMControl -Window $script:MainWindow -Name 'ChkSkipServers').IsChecked -eq $true
                 $skipVirtual = (Find-PSMMControl -Window $script:MainWindow -Name 'ChkSkipVirtual').IsChecked -eq $true
                 $computers = Get-PSMMComputers -LdapPath $ldapPath -NameFilter $nameFilter -ExcludeServers $skipServers -ExcludeVirtual $skipVirtual
+
+                # Determine local computer name for status detection
+                $localName = $env:COMPUTERNAME
+
                 $script:ComputerList.Clear()
                 foreach ($c in $computers) {
-                    $script:ComputerList.Add($c)
-                    $displayText = if ($c.Reachable -eq $false) { "$($c.Name)  [unreachable]" } else { $c.Name }
-                    $listBox.Items.Add($displayText)
+                    # Determine connection status
+                    $connStatus = if ($c.Name -eq $localName -or $c.Name -eq 'localhost') {
+                        'Local'
+                    } elseif ($c.Reachable -eq $true) {
+                        'WinRM'
+                    } elseif ($c.Reachable -eq $false) {
+                        'Unreachable'
+                    } else {
+                        'Unknown'
+                    }
+
+                    # Auto-select if Local or WinRM reachable
+                    $autoSelect = $connStatus -in @('Local', 'WinRM')
+
+                    $script:ComputerList.Add([ComputerItem]@{
+                        IsSelected       = $autoSelect
+                        Name             = $c.Name
+                        ConnectionStatus = $connStatus
+                    })
                 }
+
                 $countText = Find-PSMMControl -Window $script:MainWindow -Name 'TxtComputerCount'
                 $countText.Text = "$($computers.Count) computers"
             }
@@ -1808,15 +2037,11 @@ function Register-PSMMMainWindowEvents {
     # ── Inventory ────────────────────────────────────────────────────────────
     $btnInventory = Find-PSMMControl -Window $Window -Name 'BtnInventory'
     $btnInventory.Add_Click({
-            $listBox = Find-PSMMControl -Window $script:MainWindow -Name 'ComputerListBox'
-            $selected = @()
-            foreach ($idx in $listBox.SelectedItems) {
-                $name = ($idx -replace '\s+\[unreachable\]$', '')
-                $selected += $name
-            }
+            # Get computers checked via checkbox
+            $selected = @($script:ComputerList | Where-Object { $_.IsSelected } | ForEach-Object { $_.Name })
 
             if ($selected.Count -eq 0) {
-                [System.Windows.MessageBox]::Show('Select one or more computers first.', 'Info', 'OK', 'Information')
+                [System.Windows.MessageBox]::Show('Check one or more computers first.', 'Info', 'OK', 'Information')
                 return
             }
 
@@ -1844,17 +2069,14 @@ function Register-PSMMMainWindowEvents {
     # ── Install ──────────────────────────────────────────────────────────────
     $btnInstall = Find-PSMMControl -Window $Window -Name 'BtnInstall'
     $btnInstall.Add_Click({
-            $listBox = Find-PSMMControl -Window $script:MainWindow -Name 'ComputerListBox'
             $cmbMod = Find-PSMMControl -Window $script:MainWindow -Name 'CmbModule'
             $cmbVer = Find-PSMMControl -Window $script:MainWindow -Name 'CmbVersion'
 
-            $selected = @()
-            foreach ($idx in $listBox.SelectedItems) {
-                $selected += ($idx -replace '\s+\[unreachable\]$', '')
-            }
+            # Get computers checked via checkbox
+            $selected = @($script:ComputerList | Where-Object { $_.IsSelected } | ForEach-Object { $_.Name })
 
             if ($selected.Count -eq 0 -or -not $cmbMod.SelectedItem) {
-                [System.Windows.MessageBox]::Show('Select computer(s) and a module.', 'Info', 'OK', 'Information')
+                [System.Windows.MessageBox]::Show('Check computer(s) and select a module.', 'Info', 'OK', 'Information')
                 return
             }
 
@@ -1929,14 +2151,12 @@ function Register-PSMMMainWindowEvents {
     # ── Select/Deselect All ──────────────────────────────────────────────────
     $btnSelectAll = Find-PSMMControl -Window $Window -Name 'BtnSelectAll'
     $btnSelectAll.Add_Click({
-            $listBox = Find-PSMMControl -Window $script:MainWindow -Name 'ComputerListBox'
-            $listBox.SelectAll()
+            foreach ($item in $script:ComputerList) { $item.IsSelected = $true }
         })
 
     $btnDeselectAll = Find-PSMMControl -Window $Window -Name 'BtnDeselectAll'
     $btnDeselectAll.Add_Click({
-            $listBox = Find-PSMMControl -Window $script:MainWindow -Name 'ComputerListBox'
-            $listBox.UnselectAll()
+            foreach ($item in $script:ComputerList) { $item.IsSelected = $false }
         })
 
     # ── Clear Module Grid ────────────────────────────────────────────────────
@@ -2134,6 +2354,8 @@ function Start-PSMMJobPoller {
                                     InstalledVersion = $result.InstalledVersion
                                     TargetVersion    = ''
                                     Status           = 'Scanned'
+                                    Model            = $result.Model
+                                    OS               = $result.OS
                                 })
                             $addedCount++
                         }
@@ -2372,6 +2594,7 @@ function Show-PSMMSettingsDialog {
 
     # Capture module-scoped references as local variables so .GetNewClosure() can see them
     $settings        = $script:Settings          # hashtable reference -- mutations propagate
+    $mainWin         = $script:MainWindow        # main window reference for syncing toolbar
     $fnTestSettings  = ${function:Test-PSMMSettings}
     $fnExportSettings = ${function:Export-PSMMSettings}
     $fnWriteLog      = ${function:Write-PSMMLog}
@@ -2408,6 +2631,21 @@ function Show-PSMMSettingsDialog {
 
             & $fnExportSettings -Settings $settings
             & $fnWriteLog -Severity 'INFO' -Message 'Settings saved successfully.'
+
+            # ── Sync main window toolbar controls with saved settings ────────
+            if ($mainWin) {
+                # Skip Servers / Skip Virtual checkboxes
+                $chkSrv = $mainWin.FindName('ChkSkipServers')
+                if ($chkSrv) { $chkSrv.IsChecked = [bool]$settings['ExcludeServers'] }
+
+                $chkVm = $mainWin.FindName('ChkSkipVirtual')
+                if ($chkVm) { $chkVm.IsChecked = [bool]$settings['ExcludeVirtual'] }
+
+                # OU filter text box
+                $ouBox = $mainWin.FindName('TxtOuFilter')
+                if ($ouBox) { $ouBox.Text = [string]$settings['OuFilter'] }
+            }
+
             $settingsWin.Close()
         }.GetNewClosure())
 
@@ -2542,6 +2780,11 @@ function Show-ModuleManagerGUI {
 
     # ── Wire event handlers ──────────────────────────────────────────────────
     Register-PSMMMainWindowEvents -Window $script:MainWindow
+
+    # ── Bind the Computer list to its ObservableCollection ────────────────────
+    $compListBox = Find-PSMMControl -Window $script:MainWindow -Name 'ComputerListBox'
+    $script:ComputerList.Clear()
+    $compListBox.ItemsSource = $script:ComputerList
 
     # ── Bind the Module Inventory grid to the ObservableCollection ────────────
     $grid = Find-PSMMControl -Window $script:MainWindow -Name 'ModuleDataGrid'
