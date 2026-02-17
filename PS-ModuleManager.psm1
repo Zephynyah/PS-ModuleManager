@@ -98,6 +98,8 @@ $script:MainWindow = $null   # WPF Window reference
 $script:ComputerList = [System.Collections.ObjectModel.ObservableCollection[PSObject]]::new()
 $script:ModuleGrid = [System.Collections.ObjectModel.ObservableCollection[ModuleGridItem]]::new()
 $script:JobQueue = [System.Collections.ObjectModel.ObservableCollection[PSObject]]::new()
+$script:JobPollerTimer = $null   # active DispatcherTimer for job polling
+$script:CurrentPollerOperation = $null   # current poller operation label (Inventory/Install/Update/Remove)
 #endregion Script-Scoped State
 
 #region Configuration
@@ -2078,6 +2080,11 @@ function Start-PSMMJobPoller {
     <#
     .SYNOPSIS
         Starts a WPF DispatcherTimer that polls job completion and updates the UI.
+    .DESCRIPTION
+        Uses $script:CurrentPollerOperation (not a local variable) so the tick
+        handler can reliably read the operation label even after this function
+        returns.  PowerShell .NET-event delegates do NOT capture function-local
+        variables the way C# lambdas do -- using $script: scope is the fix.
     .PARAMETER Operation
         Label for the operation being polled (Inventory / Install / Update / Remove).
     #>
@@ -2086,33 +2093,41 @@ function Start-PSMMJobPoller {
         [string]$Operation = 'Operation'
     )
 
+    # ── Stop any previous poller ─────────────────────────────────────────────
+    if ($script:JobPollerTimer) {
+        try { $script:JobPollerTimer.Stop() } catch {}
+        $script:JobPollerTimer = $null
+    }
+
+    # ── Store operation in script scope so the tick closure can read it ──────
+    $script:CurrentPollerOperation = $Operation
+
     $timer = [System.Windows.Threading.DispatcherTimer]::new()
     $timer.Interval = [TimeSpan]::FromMilliseconds(500)
-
-    # Capture operation label for use inside the closure
-    $op = $Operation
+    $script:JobPollerTimer = $timer
 
     $timer.Add_Tick({
-            $completed = Receive-PSMMJobs
-            $running = ($script:Jobs | Where-Object { $_.Status -eq 'Running' }).Count
+            try {
+                # ── 1. Harvest completed jobs ────────────────────────────────
+                $completed = Receive-PSMMJobs
+                $running   = @($script:Jobs | Where-Object { $_.Status -eq 'Running' }).Count
 
-            # Update status bar
-            $statusJobs = Find-PSMMControl -Window $script:MainWindow -Name 'StatusJobs'
-            if ($statusJobs) {
-                $total = $script:Jobs.Count
-                $done = ($script:Jobs | Where-Object { $_.Status -ne 'Running' }).Count
-                $statusJobs.Text = "Jobs: $done / $total  |  Pool: $($script:Settings.MaxConcurrency) threads"
-            }
+                # ── 2. Update status bar ─────────────────────────────────────
+                $statusJobs = Find-PSMMControl -Window $script:MainWindow -Name 'StatusJobs'
+                if ($statusJobs) {
+                    $total = $script:Jobs.Count
+                    $done  = @($script:Jobs | Where-Object { $_.Status -ne 'Running' }).Count
+                    $statusJobs.Text = "Jobs: $done / $total  |  Running: $running  |  Pool: $($script:Settings.MaxConcurrency)"
+                }
 
-            # Process completed inventory results
-            foreach ($job in $completed) {
-                if ($job.Result) {
+                # ── 3. Process completed results ─────────────────────────────
+                $addedCount = 0
+                foreach ($job in $completed) {
+                    if (-not $job.Result) { continue }
                     foreach ($result in $job.Result) {
                         if ($result -is [PSCustomObject] -and $result.PSObject.Properties['ModuleName']) {
-                            # Skip error marker rows
                             if ($result.ModuleName -eq '_ERROR_') { continue }
 
-                            # Inventory result -- add to ObservableCollection (auto-updates grid)
                             $script:ModuleGrid.Add([ModuleGridItem]@{
                                     ComputerName     = $result.ComputerName
                                     ModuleName       = $result.ModuleName
@@ -2120,58 +2135,91 @@ function Start-PSMMJobPoller {
                                     TargetVersion    = ''
                                     Status           = 'Scanned'
                                 })
+                            $addedCount++
                         }
                         elseif ($result -is [string]) {
                             Write-PSMMLog -Severity 'INFO' -Message $result -ComputerName $job.ComputerName
                         }
                     }
                 }
+
+                # ── 4. Force the DataGrid to repaint if rows were added ──────
+                if ($addedCount -gt 0) {
+                    $grid = Find-PSMMControl -Window $script:MainWindow -Name 'ModuleDataGrid'
+                    if ($grid) {
+                        $grid.Items.Refresh()
+                        $grid.UpdateLayout()
+                    }
+                    Write-PSMMLog -Severity 'DEBUG' -Message "Poller: added $addedCount row(s) to grid (total: $($script:ModuleGrid.Count))."
+                }
+
+                # ── 5. All jobs finished? ────────────────────────────────────
+                if ($running -eq 0 -and $script:Jobs.Count -gt 0) {
+                    # Stop this timer
+                    if ($script:JobPollerTimer) {
+                        try { $script:JobPollerTimer.Stop() } catch {}
+                        $script:JobPollerTimer = $null
+                    }
+                    Write-PSMMLog -Severity 'INFO' -Message "All jobs completed. Grid rows: $($script:ModuleGrid.Count)"
+
+                    # ── 5a. Version comparison ───────────────────────────────
+                    $shareModules = Get-PSMMShareModules
+                    if ($shareModules.Count -gt 0 -and $script:ModuleGrid.Count -gt 0) {
+                        $gridItems = @($script:ModuleGrid)
+                        $compared  = Compare-PSMMModuleVersions -InstalledModules $gridItems -ShareModules $shareModules
+
+                        $script:ModuleGrid.Clear()
+                        foreach ($c in $compared) {
+                            $script:ModuleGrid.Add($c)
+                        }
+
+                        # Force grid to show the enriched data
+                        $grid = Find-PSMMControl -Window $script:MainWindow -Name 'ModuleDataGrid'
+                        if ($grid) {
+                            $grid.Items.Refresh()
+                            $grid.UpdateLayout()
+                        }
+                        Write-PSMMLog -Severity 'DEBUG' -Message "Version comparison done. Grid rows: $($script:ModuleGrid.Count)"
+                    }
+
+                    # ── 5b. Auto-refresh after Install/Update/Remove ─────────
+                    # NOTE: uses $script:CurrentPollerOperation -- NOT a local variable
+                    $currentOp = $script:CurrentPollerOperation
+                    if ($currentOp -in @('Install', 'Update', 'Remove')) {
+                        $affectedComputers = @(
+                            $script:Jobs |
+                                Where-Object { $_.Status -ne 'Running' } |
+                                ForEach-Object { $_.ComputerName } |
+                                Select-Object -Unique
+                        )
+                        if ($affectedComputers.Count -gt 0) {
+                            Write-PSMMLog -Severity 'INFO' -Message "Auto-refreshing inventory for $($affectedComputers.Count) computer(s) after $currentOp ..."
+
+                            # Clear grid rows for affected computers
+                            $toRemove = @($script:ModuleGrid | Where-Object { $affectedComputers -contains $_.ComputerName })
+                            foreach ($item in $toRemove) { $script:ModuleGrid.Remove($item) }
+
+                            # Module filter from combo box
+                            $cmbMod    = Find-PSMMControl -Window $script:MainWindow -Name 'CmbModule'
+                            $modFilter = if ($cmbMod -and $cmbMod.SelectedItem) { $cmbMod.SelectedItem.ToString() } else { $null }
+
+                            # Reset jobs list so new poller starts clean
+                            $script:Jobs.Clear()
+
+                            # Launch inventory and start a fresh poller
+                            $null = Get-PSMMRemoteModules -ComputerNames $affectedComputers -ModuleName $modFilter
+                            Start-PSMMJobPoller -Operation 'Inventory'
+                        }
+                    }
+                }
             }
-
-            # Refresh grid after processing results
-
-            # Stop timer when all done
-            if ($running -eq 0) {
-                $this.Stop()
-                Write-PSMMLog -Severity 'INFO' -Message "All jobs completed."
-
-                # If inventory, do version comparison
-                $shareModules = Get-PSMMShareModules
-                if ($shareModules.Count -gt 0 -and $script:ModuleGrid.Count -gt 0) {
-                    $gridItems = @($script:ModuleGrid)
-                    $compared = Compare-PSMMModuleVersions -InstalledModules $gridItems -ShareModules $shareModules
-                    $script:ModuleGrid.Clear()
-                    foreach ($c in $compared) {
-                        $script:ModuleGrid.Add($c)
-                    }
-                }
-
-                # After Install/Update/Remove, auto-refresh inventory for affected computers
-                if ($op -in @('Install', 'Update', 'Remove')) {
-                    # Gather the distinct computer names from the jobs that just finished
-                    $affectedComputers = @($script:Jobs | Where-Object { $_.Status -ne 'Running' } | ForEach-Object { $_.ComputerName } | Select-Object -Unique)
-                    if ($affectedComputers.Count -gt 0) {
-                        Write-PSMMLog -Severity 'INFO' -Message "Auto-refreshing inventory for $($affectedComputers.Count) computer(s) after $op ..."
-
-                        # Clear existing rows for affected computers
-                        $toRemove = @($script:ModuleGrid | Where-Object { $affectedComputers -contains $_.ComputerName })
-                        foreach ($item in $toRemove) { $script:ModuleGrid.Remove($item) }
-
-                        # Determine module filter from the combo box
-                        $cmbMod = Find-PSMMControl -Window $script:MainWindow -Name 'CmbModule'
-                        $modFilter = if ($cmbMod -and $cmbMod.SelectedItem) { $cmbMod.SelectedItem.ToString() } else { $null }
-
-                        # Clear completed jobs so the new poller starts fresh
-                        $script:Jobs.Clear()
-
-                        # Launch the inventory and poll it
-                        $null = Get-PSMMRemoteModules -ComputerNames $affectedComputers -ModuleName $modFilter
-                        Start-PSMMJobPoller -Operation 'Inventory'
-                    }
-                }
+            catch {
+                Write-PSMMLog -Severity 'ERROR' -Message "Job poller tick error: $_"
+                # Do NOT kill the timer on transient errors -- only stop if truly fatal
             }
         })
 
+    Write-PSMMLog -Severity 'DEBUG' -Message "Job poller started (operation: $Operation, interval: 500ms)."
     $timer.Start()
 }
 #endregion Job Poller

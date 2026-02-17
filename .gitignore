@@ -40,6 +40,6 @@ $RECYCLE.BIN/
 *.backup
 *~
 
-
+# Directories to ignore
 dev/
 test/
