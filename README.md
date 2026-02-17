@@ -86,6 +86,8 @@ Edit `settings.json` (created automatically on first run) or use the built-in Se
         +-- module.zip
 ```
 
+Each version folder can contain **either** loose module files (`.psm1`, `.psd1`, etc.) **or** a `module.zip`. ZIP files can contain the module files at the archive root or inside a single wrapper folder -- the installer automatically detects and unwraps it. Source files are staged onto the remote computer before extraction, so no CredSSP or double-hop configuration is needed.
+
 ## Project Structure
 
 ```
