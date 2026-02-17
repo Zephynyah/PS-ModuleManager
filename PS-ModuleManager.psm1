@@ -2476,7 +2476,7 @@ function Register-PSMMMainWindowEvents {
     # ── Export Inventory to CSV ──────────────────────────────────────────────
     $btnExportCsv = Find-PSMMControl -Window $Window -Name 'BtnExportCsv'
     $btnExportCsv.Add_Click({
-            Invoke-PSMMSafeAction -Window $script:MainWindow -ScriptBlock {
+            Invoke-PSMMSafeAction -Context $script:MainWindow -Action {
                 if ($script:ModuleGrid.Count -eq 0) {
                     [System.Windows.MessageBox]::Show('No inventory data to export.', 'Info', 'OK', 'Information')
                     return
@@ -3269,7 +3269,7 @@ function Show-ModuleManagerGUI {
     }
 
     # ── Ensure window is topmost ───────────────────────────────────────────
-    $script:MainWindow.Topmost = $true
+    #$script:MainWindow.Topmost = $true
 
     # ── Set window properties ──────────────────────────────────────────────
     $script:MainWindow.WindowStartupLocation = $WindowStartupLocation
