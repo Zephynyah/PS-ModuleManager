@@ -33,6 +33,46 @@ Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms   # for FolderBrowserDialog fallback
+
+# ── Define a WPF-friendly data class for the Module Inventory grid ────────────
+Add-Type -TypeDefinition @"
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
+
+public class ModuleGridItem : INotifyPropertyChanged {
+    private string _computerName;
+    private string _moduleName;
+    private string _installedVersion;
+    private string _targetVersion;
+    private string _status;
+
+    public string ComputerName {
+        get { return _computerName; }
+        set { _computerName = value; OnPropertyChanged(); }
+    }
+    public string ModuleName {
+        get { return _moduleName; }
+        set { _moduleName = value; OnPropertyChanged(); }
+    }
+    public string InstalledVersion {
+        get { return _installedVersion; }
+        set { _installedVersion = value; OnPropertyChanged(); }
+    }
+    public string TargetVersion {
+        get { return _targetVersion; }
+        set { _targetVersion = value; OnPropertyChanged(); }
+    }
+    public string Status {
+        get { return _status; }
+        set { _status = value; OnPropertyChanged(); }
+    }
+
+    public event PropertyChangedEventHandler PropertyChanged;
+    protected void OnPropertyChanged([CallerMemberName] string name = null) {
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+    }
+}
+"@
 #endregion Assembly Loading
 
 
@@ -56,7 +96,7 @@ $script:LogEntries = [System.Collections.ArrayList]::new()   # in-memory log buf
 $script:Credential = $null   # [PSCredential] when using Prompt/Stored mode
 $script:MainWindow = $null   # WPF Window reference
 $script:ComputerList = [System.Collections.ObjectModel.ObservableCollection[PSObject]]::new()
-$script:ModuleGrid = [System.Collections.ObjectModel.ObservableCollection[PSObject]]::new()
+$script:ModuleGrid = [System.Collections.ObjectModel.ObservableCollection[ModuleGridItem]]::new()
 $script:JobQueue = [System.Collections.ObjectModel.ObservableCollection[PSObject]]::new()
 #endregion Script-Scoped State
 
@@ -837,7 +877,7 @@ function Compare-PSMMModuleVersions {
             catch { 'Unknown' }
         }
 
-        [PSCustomObject]@{
+        [ModuleGridItem]@{
             ComputerName     = $mod.ComputerName
             ModuleName       = $mod.ModuleName
             InstalledVersion = $mod.InstalledVersion
@@ -1791,7 +1831,6 @@ function Register-PSMMMainWindowEvents {
             # Clear previous inventory rows for the selected computers to avoid duplicates
             $toRemove = @($script:ModuleGrid | Where-Object { $selected -contains $_.ComputerName })
             foreach ($item in $toRemove) { $script:ModuleGrid.Remove($item) }
-            & $script:RefreshGrid
 
             # Launch async inventory -- filtered to the selected module if one is chosen
             $null = Get-PSMMRemoteModules -ComputerNames $selected -ModuleName $modFilter
@@ -1902,7 +1941,6 @@ function Register-PSMMMainWindowEvents {
     $btnClearGrid = Find-PSMMControl -Window $Window -Name 'BtnClearGrid'
     $btnClearGrid.Add_Click({
             $script:ModuleGrid.Clear()
-            & $script:RefreshGrid
         })
 
     # ── Export Log ───────────────────────────────────────────────────────────
@@ -2075,7 +2113,7 @@ function Start-PSMMJobPoller {
                             if ($result.ModuleName -eq '_ERROR_') { continue }
 
                             # Inventory result -- add to ObservableCollection (auto-updates grid)
-                            $script:ModuleGrid.Add([PSCustomObject]@{
+                            $script:ModuleGrid.Add([ModuleGridItem]@{
                                     ComputerName     = $result.ComputerName
                                     ModuleName       = $result.ModuleName
                                     InstalledVersion = $result.InstalledVersion
@@ -2091,7 +2129,6 @@ function Start-PSMMJobPoller {
             }
 
             # Refresh grid after processing results
-            if ($completed.Count -gt 0) { & $script:RefreshGrid }
 
             # Stop timer when all done
             if ($running -eq 0) {
@@ -2107,7 +2144,6 @@ function Start-PSMMJobPoller {
                     foreach ($c in $compared) {
                         $script:ModuleGrid.Add($c)
                     }
-                    & $script:RefreshGrid
                 }
 
                 # After Install/Update/Remove, auto-refresh inventory for affected computers
@@ -2120,7 +2156,6 @@ function Start-PSMMJobPoller {
                         # Clear existing rows for affected computers
                         $toRemove = @($script:ModuleGrid | Where-Object { $affectedComputers -contains $_.ComputerName })
                         foreach ($item in $toRemove) { $script:ModuleGrid.Remove($item) }
-                        & $script:RefreshGrid
 
                         # Determine module filter from the combo box
                         $cmbMod = Find-PSMMControl -Window $script:MainWindow -Name 'CmbModule'
@@ -2464,14 +2499,6 @@ function Show-ModuleManagerGUI {
     $grid = Find-PSMMControl -Window $script:MainWindow -Name 'ModuleDataGrid'
     $script:ModuleGrid.Clear()
     $grid.ItemsSource = $script:ModuleGrid
-
-    # Helper: force the DataGrid to refresh its view after collection changes
-    $script:RefreshGrid = {
-        $g = $script:MainWindow.FindName('ModuleDataGrid')
-        if ($g) {
-            $g.Items.Refresh()
-        }
-    }
 
     # ── Initial log entry ────────────────────────────────────────────────────
     Write-PSMMLog -Severity 'INFO' -Message 'PS-ModuleManager v1.0.0 started.'
