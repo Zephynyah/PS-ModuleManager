@@ -1,4 +1,4 @@
-# Self-elevate to Administrator if not already running elevated
+﻿# Self-elevate to Administrator if not already running elevated
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host 'Restarting as Administrator ...' -ForegroundColor Yellow
     $psExe = if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' }

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     PS-ModuleManager -- A WPF-based PowerShell Module Manager.
 
@@ -184,7 +184,7 @@ function Get-PSMMDefaultSettings {
         JobTimeoutSeconds = 300
         ExcludeServers    = $false
         ExcludeVirtual    = $false
-        GlobalExcludeList = @()                        # e.g. @('Server1','Server2')
+        GlobalExcludeList = @()                         # e.g. @('Server1','Server2') - may be $null in PS 5.1
     }
 }
 
@@ -375,9 +375,11 @@ function Invoke-PSMMLogRotation {
         Removes log files older than the specified retention period.
     .DESCRIPTION
         Scans the configured log directory for PS-ModuleManager_*.log files
-        and deletes any older than MaxAgeDays (default 30).  Also enforces
+        and deletes any older than RetentionDays (default 30).  Also enforces
         a maximum total log directory size (default 10 MB).
-    .PARAMETER MaxAgeDays
+    .PARAMETER LogPath
+        Path to the log directory.  If not specified, uses $script:Settings.LogPath.
+    .PARAMETER RetentionDays
         Number of days to retain log files.  Files older than this are deleted.
     .PARAMETER MaxTotalSizeMB
         Maximum total size (in MB) of all log files.  Oldest files are removed
@@ -385,11 +387,12 @@ function Invoke-PSMMLogRotation {
     #>
     [CmdletBinding()]
     param(
-        [int]$MaxAgeDays = 30,
+        [string]$LogPath,
+        [int]$RetentionDays = 30,
         [int]$MaxTotalSizeMB = 10
     )
 
-    $logDir = if ($script:Settings.LogPath) { $script:Settings.LogPath } else { Join-Path $script:ModuleRoot 'logs' }
+    $logDir = if ($LogPath) { $LogPath } elseif ($script:Settings.LogPath) { $script:Settings.LogPath } else { Join-Path $script:ModuleRoot 'logs' }
     if (-not (Test-Path -LiteralPath $logDir)) { return }
 
     $logFiles = Get-ChildItem -LiteralPath $logDir -Filter 'PS-ModuleManager_*.log' -File -ErrorAction SilentlyContinue |
@@ -397,7 +400,7 @@ function Invoke-PSMMLogRotation {
 
     if (-not $logFiles -or $logFiles.Count -eq 0) { return }
 
-    $cutoff = (Get-Date).AddDays(-$MaxAgeDays)
+    $cutoff = (Get-Date).AddDays(-$RetentionDays)
     $removed = 0
 
     # Remove files older than retention period
