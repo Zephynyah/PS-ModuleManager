@@ -1789,16 +1789,9 @@ function Register-PSMMMainWindowEvents {
             }
 
             # Clear previous inventory rows for the selected computers to avoid duplicates
-            $grid = Find-PSMMControl -Window $script:MainWindow -Name 'ModuleDataGrid'
-            if ($grid) {
-                $toRemove = @()
-                foreach ($item in $grid.Items) {
-                    if ($item -is [PSCustomObject] -and $selected -contains $item.ComputerName) {
-                        $toRemove += $item
-                    }
-                }
-                foreach ($item in $toRemove) { $grid.Items.Remove($item) }
-            }
+            $toRemove = @($script:ModuleGrid | Where-Object { $selected -contains $_.ComputerName })
+            foreach ($item in $toRemove) { $script:ModuleGrid.Remove($item) }
+            & $script:RefreshGrid
 
             # Launch async inventory -- filtered to the selected module if one is chosen
             $null = Get-PSMMRemoteModules -ComputerNames $selected -ModuleName $modFilter
@@ -1908,8 +1901,8 @@ function Register-PSMMMainWindowEvents {
     # ── Clear Module Grid ────────────────────────────────────────────────────
     $btnClearGrid = Find-PSMMControl -Window $Window -Name 'BtnClearGrid'
     $btnClearGrid.Add_Click({
-            $grid = Find-PSMMControl -Window $script:MainWindow -Name 'ModuleDataGrid'
-            $grid.Items.Clear()
+            $script:ModuleGrid.Clear()
+            & $script:RefreshGrid
         })
 
     # ── Export Log ───────────────────────────────────────────────────────────
@@ -2081,17 +2074,14 @@ function Start-PSMMJobPoller {
                             # Skip error marker rows
                             if ($result.ModuleName -eq '_ERROR_') { continue }
 
-                            # Inventory result -- add to grid
-                            $grid = Find-PSMMControl -Window $script:MainWindow -Name 'ModuleDataGrid'
-                            if ($grid) {
-                                $grid.Items.Add([PSCustomObject]@{
-                                        ComputerName     = $result.ComputerName
-                                        ModuleName       = $result.ModuleName
-                                        InstalledVersion = $result.InstalledVersion
-                                        TargetVersion    = ''
-                                        Status           = 'Scanned'
-                                    })
-                            }
+                            # Inventory result -- add to ObservableCollection (auto-updates grid)
+                            $script:ModuleGrid.Add([PSCustomObject]@{
+                                    ComputerName     = $result.ComputerName
+                                    ModuleName       = $result.ModuleName
+                                    InstalledVersion = $result.InstalledVersion
+                                    TargetVersion    = ''
+                                    Status           = 'Scanned'
+                                })
                         }
                         elseif ($result -is [string]) {
                             Write-PSMMLog -Severity 'INFO' -Message $result -ComputerName $job.ComputerName
@@ -2100,6 +2090,9 @@ function Start-PSMMJobPoller {
                 }
             }
 
+            # Refresh grid after processing results
+            if ($completed.Count -gt 0) { & $script:RefreshGrid }
+
             # Stop timer when all done
             if ($running -eq 0) {
                 $this.Stop()
@@ -2107,18 +2100,14 @@ function Start-PSMMJobPoller {
 
                 # If inventory, do version comparison
                 $shareModules = Get-PSMMShareModules
-                if ($shareModules.Count -gt 0) {
-                    $grid = Find-PSMMControl -Window $script:MainWindow -Name 'ModuleDataGrid'
-                    if ($grid -and $grid.Items.Count -gt 0) {
-                        $gridItems = @()
-                        foreach ($item in $grid.Items) { $gridItems += $item }
-
-                        $compared = Compare-PSMMModuleVersions -InstalledModules $gridItems -ShareModules $shareModules
-                        $grid.Items.Clear()
-                        foreach ($c in $compared) {
-                            $grid.Items.Add($c)
-                        }
+                if ($shareModules.Count -gt 0 -and $script:ModuleGrid.Count -gt 0) {
+                    $gridItems = @($script:ModuleGrid)
+                    $compared = Compare-PSMMModuleVersions -InstalledModules $gridItems -ShareModules $shareModules
+                    $script:ModuleGrid.Clear()
+                    foreach ($c in $compared) {
+                        $script:ModuleGrid.Add($c)
                     }
+                    & $script:RefreshGrid
                 }
 
                 # After Install/Update/Remove, auto-refresh inventory for affected computers
@@ -2128,21 +2117,17 @@ function Start-PSMMJobPoller {
                     if ($affectedComputers.Count -gt 0) {
                         Write-PSMMLog -Severity 'INFO' -Message "Auto-refreshing inventory for $($affectedComputers.Count) computer(s) after $op ..."
 
-                        # Clear existing grid rows for affected computers
-                        $grid = Find-PSMMControl -Window $script:MainWindow -Name 'ModuleDataGrid'
-                        if ($grid) {
-                            $toRemove = @()
-                            foreach ($item in $grid.Items) {
-                                if ($item -is [PSCustomObject] -and $affectedComputers -contains $item.ComputerName) {
-                                    $toRemove += $item
-                                }
-                            }
-                            foreach ($item in $toRemove) { $grid.Items.Remove($item) }
-                        }
+                        # Clear existing rows for affected computers
+                        $toRemove = @($script:ModuleGrid | Where-Object { $affectedComputers -contains $_.ComputerName })
+                        foreach ($item in $toRemove) { $script:ModuleGrid.Remove($item) }
+                        & $script:RefreshGrid
 
                         # Determine module filter from the combo box
                         $cmbMod = Find-PSMMControl -Window $script:MainWindow -Name 'CmbModule'
                         $modFilter = if ($cmbMod -and $cmbMod.SelectedItem) { $cmbMod.SelectedItem.ToString() } else { $null }
+
+                        # Clear completed jobs so the new poller starts fresh
+                        $script:Jobs.Clear()
 
                         # Launch the inventory and poll it
                         $null = Get-PSMMRemoteModules -ComputerNames $affectedComputers -ModuleName $modFilter
@@ -2474,6 +2459,19 @@ function Show-ModuleManagerGUI {
 
     # ── Wire event handlers ──────────────────────────────────────────────────
     Register-PSMMMainWindowEvents -Window $script:MainWindow
+
+    # ── Bind the Module Inventory grid to the ObservableCollection ────────────
+    $grid = Find-PSMMControl -Window $script:MainWindow -Name 'ModuleDataGrid'
+    $script:ModuleGrid.Clear()
+    $grid.ItemsSource = $script:ModuleGrid
+
+    # Helper: force the DataGrid to refresh its view after collection changes
+    $script:RefreshGrid = {
+        $g = $script:MainWindow.FindName('ModuleDataGrid')
+        if ($g) {
+            $g.Items.Refresh()
+        }
+    }
 
     # ── Initial log entry ────────────────────────────────────────────────────
     Write-PSMMLog -Severity 'INFO' -Message 'PS-ModuleManager v1.0.0 started.'
