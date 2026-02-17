@@ -1102,6 +1102,10 @@ function Uninstall-PSMMModule {
         Name of the module to remove.
     .PARAMETER Version
         Specific version to remove.  If omitted, removes all versions.
+    .PARAMETER ModulePath
+        The actual path (PSModulePath / ModuleBase) where the module is installed.
+        When provided, this exact path is removed instead of guessing from the
+        default ProgramFiles location.
     .PARAMETER Credential
         Optional PSCredential for remoting.
     .OUTPUTS
@@ -1117,25 +1121,34 @@ function Uninstall-PSMMModule {
 
         [string]$Version,
 
+        [string]$ModulePath,
+
         [PSCredential]$Credential = $script:Credential
     )
 
     Write-PSMMLog -Severity 'INFO' -Message "Removing $ModuleName $(if ($Version) {"v$Version "})from $($ComputerNames.Count) computer(s) ..."
 
     $removeScript = {
-        param($Computer, $Cred, $ModName, $Ver)
+        param($Computer, $Cred, $ModName, $Ver, $KnownPath)
         try {
             $innerSb = {
-                param($ModName, $Ver)
+                param($ModName, $Ver, $KnownPath)
                 # Unload if loaded
                 Remove-Module -Name $ModName -Force -ErrorAction SilentlyContinue
 
-                $destRoot = Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'
-                if ($Ver) {
-                    $target = Join-Path $destRoot "$ModName\$Ver"
+                # Use the known path from inventory if available
+                if ($KnownPath -and (Test-Path $KnownPath)) {
+                    $target = $KnownPath
                 }
                 else {
-                    $target = Join-Path $destRoot $ModName
+                    # Fallback: try standard ProgramFiles location
+                    $destRoot = Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'
+                    if ($Ver) {
+                        $target = Join-Path $destRoot "$ModName\$Ver"
+                    }
+                    else {
+                        $target = Join-Path $destRoot $ModName
+                    }
                 }
 
                 if (Test-Path $target) {
@@ -1149,13 +1162,13 @@ function Uninstall-PSMMModule {
 
             $isLocal = ($Computer -eq $env:COMPUTERNAME) -or ($Computer -eq 'localhost') -or ($Computer -eq '.')
             if ($isLocal) {
-                & $innerSb $ModName $Ver
+                & $innerSb $ModName $Ver $KnownPath
             } else {
                 $splat = @{
                     ComputerName = $Computer
                     ErrorAction  = 'Stop'
                     ScriptBlock  = $innerSb
-                    ArgumentList = @($ModName, $Ver)
+                    ArgumentList = @($ModName, $Ver, $KnownPath)
                 }
                 if ($Cred) { $splat['Credential'] = $Cred }
                 Invoke-Command @splat
@@ -1166,7 +1179,7 @@ function Uninstall-PSMMModule {
         }
     }
 
-    $jobs = Invoke-PSMMParallel -ComputerNames $ComputerNames -ScriptBlock $removeScript -ArgumentList @($Credential, $ModuleName, $Version)
+    $jobs = Invoke-PSMMParallel -ComputerNames $ComputerNames -ScriptBlock $removeScript -ArgumentList @($Credential, $ModuleName, $Version, $ModulePath)
     return $jobs
 }
 #endregion Module Deployment
@@ -1644,7 +1657,7 @@ $script:MainWindowXaml = @'
                         <DataGridTextColumn Header="Installed"         Binding="{Binding InstalledVersion}" Width="2*"/>
                         <DataGridTextColumn Header="Available"         Binding="{Binding TargetVersion}"    Width="2*"/>
                         <DataGridTextColumn Header="Status"            Binding="{Binding Status}"           Width="2*"/>
-                        <DataGridTextColumn Header="Path"              Binding="{Binding PSModulePath}"      Width="4*"/>
+                        <DataGridTextColumn Header="Path"              Binding="{Binding PSModulePath}"      Width="6*"/>
                     </DataGrid.Columns>
                 </DataGrid>
             </DockPanel>
@@ -2142,7 +2155,7 @@ function Register-PSMMMainWindowEvents {
 
             if ($confirm -eq 'Yes') {
                 foreach ($item in $grid.SelectedItems) {
-                    $null = Uninstall-PSMMModule -ComputerNames @($item.ComputerName) -ModuleName $item.ModuleName -Version $item.InstalledVersion
+                    $null = Uninstall-PSMMModule -ComputerNames @($item.ComputerName) -ModuleName $item.ModuleName -Version $item.InstalledVersion -ModulePath $item.PSModulePath
                 }
                 Start-PSMMJobPoller -Operation 'Remove'
             }
