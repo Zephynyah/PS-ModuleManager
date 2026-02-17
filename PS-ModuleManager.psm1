@@ -82,6 +82,7 @@ public class ModuleGridItem : INotifyPropertyChanged {
     private string _status;
     private string _model;
     private string _os;
+    private string _psModulePath;
 
     public string ComputerName {
         get { return _computerName; }
@@ -110,6 +111,10 @@ public class ModuleGridItem : INotifyPropertyChanged {
     public string OS {
         get { return _os; }
         set { _os = value; OnPropertyChanged(); }
+    }
+    public string PSModulePath {
+        get { return _psModulePath; }
+        set { _psModulePath = value; OnPropertyChanged(); }
     }
 
     public event PropertyChangedEventHandler PropertyChanged;
@@ -962,6 +967,7 @@ function Compare-PSMMModuleVersions {
             Status           = $status
             Model            = $mod.Model
             OS               = $mod.OS
+            PSModulePath     = if ($mod.PSObject.Properties['PSModulePath']) { $mod.PSModulePath } else { $mod.ModuleBase }
         }
     }
 
@@ -1638,6 +1644,7 @@ $script:MainWindowXaml = @'
                         <DataGridTextColumn Header="Installed"         Binding="{Binding InstalledVersion}" Width="2*"/>
                         <DataGridTextColumn Header="Available"         Binding="{Binding TargetVersion}"    Width="2*"/>
                         <DataGridTextColumn Header="Status"            Binding="{Binding Status}"           Width="2*"/>
+                        <DataGridTextColumn Header="Path"              Binding="{Binding PSModulePath}"      Width="4*"/>
                     </DataGrid.Columns>
                 </DataGrid>
             </DockPanel>
@@ -2356,6 +2363,7 @@ function Start-PSMMJobPoller {
                                     Status           = 'Scanned'
                                     Model            = $result.Model
                                     OS               = $result.OS
+                                    PSModulePath     = $result.ModuleBase
                                 })
                             $addedCount++
                         }
