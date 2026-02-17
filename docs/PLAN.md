@@ -38,8 +38,9 @@ PS-ModuleManager.psm1            <-- everything lives here
 |-- #region WPF Helpers            (New-PSMMWindow, Find-PSMMControl, Update-PSMMDispatcher)
 |-- #region WPF Event Handlers     (Register-PSMMMainWindowEvents -- all button/menu wiring)
 |-- #region Job Poller             (Start-PSMMJobPoller -- DispatcherTimer for async result polling)
+|-- #region ADSI Helper            (Get-ADSIInfo -- domain/OU discovery helper)
 |-- #region Settings Dialog        (Show-PSMMSettingsDialog -- modal settings editor)
-+-- #region Exported Function      (Show-ModuleManagerGUI -- single public entry-point)
++-- #region Exported Function      (Show-ModuleManagerGUI, Get-ADSIInfo -- public entry-points)
 ```
 
 ### 2.1 Internal Functions
@@ -68,6 +69,7 @@ PS-ModuleManager.psm1            <-- everything lives here
 | `Update-PSMMDispatcher` | WPF Helpers | Thread-safe UI update via Dispatcher.Invoke |
 | `Register-PSMMMainWindowEvents` | Event Handlers | Wires all button/menu event handlers |
 | `Start-PSMMJobPoller` | Job Poller | DispatcherTimer to poll async job completion |
+| `Get-ADSIInfo` | ADSI Helper | Discovers domain LDAP path and enumerates OUs (exported) |
 | `Show-PSMMSettingsDialog` | Settings Dialog | Opens modal settings editor window |
 
 ### 2.2 Data Models (PSCustomObject patterns)
@@ -75,9 +77,9 @@ PS-ModuleManager.psm1            <-- everything lives here
 | Model | Properties |
 |-------|-----------|
 | `ComputerInfo` | `Name`, `DNSHostName`, `OU`, `Enabled`, `OS`, `Reachable` |
-| `ModuleInfo` | `ComputerName`, `ModuleName`, `InstalledVersion`, `TargetVersion`, `Status` (UpToDate / Outdated / Missing / Unknown) |
+| `ModuleInfo` | `ComputerName`, `ModuleName`, `InstalledVersion`, `TargetVersion`, `Status` (UpToDate / Outdated / Missing / Unknown), `PSModulePath` |
 | `DeploymentJob` | `Id`, `ComputerName`, `ModuleName`, `Operation` (Install / Update / Remove), `Status` (Queued / Running / Completed / Failed), `Message`, `Timestamp` |
-| `AppSettings` | `DomainLdapPath`, `OuFilter`, `ModuleSearchPaths`, `CentralSharePath`, `MaxConcurrency`, `CredentialMode`, `LogPath`, `RetryCount`, `ReachabilityCheck`, `LogLevel`, `JobTimeoutSeconds` |
+| `AppSettings` | `DomainLdapPath`, `OuFilter`, `ModuleSearchPaths`, `CentralSharePath`, `MaxConcurrency`, `CredentialMode`, `LogPath`, `RetryCount`, `ReachabilityCheck`, `LogLevel`, `JobTimeoutSeconds`, `ExcludeServers`, `ExcludeVirtual`, `GlobalExcludeList` |
 
 ---
 
@@ -167,11 +169,16 @@ PS-ModuleManager.psm1            <-- everything lives here
 | File | Purpose |
 |------|---------|
 | `PS-ModuleManager.psd1` | Module manifest (version, GUID, exported functions, required assemblies). |
-| `PS-ModuleManager.psm1` | **Single comprehensive module** -- all code, inline WPF XAML, and logic (~1900 lines). |
+| `PS-ModuleManager.psm1` | **Single comprehensive module** -- all code, inline WPF XAML, and logic (~2845 lines). |
+| `PS-ModuleManager.ps1` | Self-elevating launcher script (auto-admin, console hiding, imports module, launches GUI maximized). |
 | `settings.json` | Sample / default configuration (created on first run if missing). |
+| `CHANGELOG.md` | Project changelog following Keep a Changelog format. |
 | `docs/PLAN.md` | This plan document. |
 | `README.md` | Quick-start, configuration reference, project structure. |
 | `LICENSE` | License file. |
+| `scripts/Create-Shortcut.ps1` | Creates a desktop shortcut to launch PS-ModuleManager. |
+| `scripts/Get-ADSIInfo.ps1` | Standalone script to discover domain LDAP path and OUs. |
+| `test/` | Test scripts for development and validation. |
 
 ---
 
@@ -186,6 +193,18 @@ Show-ModuleManagerGUI
 
 # Or with a custom settings file
 Show-ModuleManagerGUI -SettingsPath "C:\Config\settings.json"
+
+# Launch maximized and centered on owner window
+Show-ModuleManagerGUI -WindowStartupLocation CenterOwner -WindowState Maximized
+
+# Discover domain info for settings.json
+Get-ADSIInfo
+```
+
+Alternatively, use the self-elevating launcher:
+
+```powershell
+.\PS-ModuleManager.ps1
 ```
 
 ---

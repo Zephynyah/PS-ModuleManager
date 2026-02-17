@@ -33,6 +33,22 @@ Show-ModuleManagerGUI
 
 # Or with a custom settings file
 Show-ModuleManagerGUI -SettingsPath "C:\Config\settings.json"
+
+# Launch maximized and centered on owner window
+Show-ModuleManagerGUI -WindowStartupLocation CenterOwner -WindowState Maximized
+```
+
+Alternatively, use the self-elevating launcher script:
+
+```powershell
+# Automatically elevates to Administrator and hides the console window
+.\PS-ModuleManager.ps1
+```
+
+Or create a desktop shortcut:
+
+```powershell
+.\scripts\Create-Shortcut.ps1
 ```
 
 ## Configuration
@@ -44,6 +60,7 @@ Edit `settings.json` (created automatically on first run) or use the built-in Se
 | `DomainLdapPath` | LDAP path to domain root | *(auto-detect)* |
 | `OuFilter` | OU scope for computer search | *(all)* |
 | `CentralSharePath` | UNC path to module repository | *(empty)* |
+| `ModuleSearchPaths` | Local paths to search for installed modules | `C:\Program Files\WindowsPowerShell\Modules` |
 | `MaxConcurrency` | Parallel runspace threads | `4` |
 | `CredentialMode` | `Default` / `Prompt` / `Stored` | `Default` |
 | `LogPath` | Directory for log files | `logs/` |
@@ -51,6 +68,9 @@ Edit `settings.json` (created automatically on first run) or use the built-in Se
 | `RetryCount` | Retry attempts for failed operations | `2` |
 | `ReachabilityCheck` | Test WinRM before operations | `true` |
 | `JobTimeoutSeconds` | Per-job timeout for remote operations | `300` |
+| `ExcludeServers` | Skip server OS computers during discovery | `false` |
+| `ExcludeVirtual` | Skip virtual machines during discovery | `false` |
+| `GlobalExcludeList` | Array of computer names to always exclude | `[]` |
 
 ## Central Share Layout
 
@@ -70,20 +90,30 @@ Edit `settings.json` (created automatically on first run) or use the built-in Se
 
 ```
 PS-ModuleManager/
-+-- PS-ModuleManager.psd1   # Module manifest
-+-- PS-ModuleManager.psm1   # Single comprehensive module (all code + inline WPF XAML)
-+-- settings.json            # Configuration file (auto-created on first run)
-+-- docs/
-|   +-- PLAN.md              # Detailed project plan & architecture
++-- PS-ModuleManager.psd1    # Module manifest
++-- PS-ModuleManager.psm1    # Single comprehensive module (all code + inline WPF XAML)
++-- PS-ModuleManager.ps1     # Self-elevating launcher script (hides console, imports module, launches GUI)
++-- settings.json             # Configuration file (auto-created on first run)
++-- CHANGELOG.md              # Project changelog
 +-- README.md
 +-- LICENSE
++-- docs/
+|   +-- PLAN.md               # Detailed project plan & architecture
++-- scripts/
+|   +-- Create-Shortcut.ps1   # Creates a desktop shortcut to launch the module
+|   +-- Get-ADSIInfo.ps1      # Standalone script to discover domain LDAP path and OUs
++-- logs/                     # Log file output directory
++-- test/
+|   +-- test.ps1              # Test scripts
+|   +-- test2.ps1
 ```
 
-## Exported Command
+## Exported Commands
 
 | Command | Description |
 |---------|-------------|
-| `Show-ModuleManagerGUI` | Opens the WPF Module Manager window. Accepts optional `-SettingsPath` parameter. |
+| `Show-ModuleManagerGUI` | Opens the WPF Module Manager window. Accepts `-SettingsPath`, `-WindowStartupLocation`, and `-WindowState` parameters. |
+| `Get-ADSIInfo` | Discovers the domain LDAP path and enumerates available OUs via ADSI. Useful for populating `settings.json`. |
 
 ## License
 
