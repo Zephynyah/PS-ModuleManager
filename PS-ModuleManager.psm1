@@ -673,23 +673,23 @@ function Get-PSMMComputers {
     }
 
     # GlobalExcludeList -- skip computers matching these patterns (supports wildcards)
-    $excludeList = $script:Settings.GlobalExcludeList
-    if ($excludeList -and $excludeList.Count -gt 0) {
-        $before = $filtered.Count
-        $filtered = @($filtered | Where-Object {
-            $computerName = $_.Name
-            $shouldExclude = $false
-            foreach ($pattern in $excludeList) {
-                if ($computerName -like $pattern) {
-                    $shouldExclude = $true
-                    break
-                }
-            }
-            -not $shouldExclude
-        })
-        $skipped = $before - $filtered.Count
-        if ($skipped -gt 0) { Write-PSMMLog -Severity 'INFO' -Message "Excluded $skipped computer(s) via GlobalExcludeList." }
-    }
+    # $excludeList = $script:Settings.GlobalExcludeList
+    # if ($excludeList -and $excludeList.Count -gt 0) {
+    #     $before = $filtered.Count
+    #     $filtered = @($filtered | Where-Object {
+    #         $computerName = $_.Name
+    #         $shouldExclude = $false
+    #         foreach ($pattern in $excludeList) {
+    #             if ($computerName -like $pattern) {
+    #                 $shouldExclude = $true
+    #                 break
+    #             }
+    #         }
+    #         -not $shouldExclude
+    #     })
+    #     $skipped = $before - $filtered.Count
+    #     if ($skipped -gt 0) { Write-PSMMLog -Severity 'INFO' -Message "Excluded $skipped computer(s) via GlobalExcludeList." }
+    # }
 
     return $filtered
 }
