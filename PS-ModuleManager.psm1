@@ -663,11 +663,30 @@ function Get-PSMMComputers {
         if ($skipped -gt 0) { Write-PSMMLog -Severity 'INFO' -Message "Excluded $skipped virtual device(s) from results." }
     }
 
-    # GlobalExcludeList -- always skip these computer names
+    # OS Filter -- include only computers whose OS matches the pattern
+    if ($OSFilter -and $OSFilter -ne '') {
+        $before = $filtered.Count
+        $filtered = @($filtered | Where-Object { $_.OS -like $OSFilter })
+        $kept = $filtered.Count
+        $skipped = $before - $kept
+        if ($skipped -gt 0) { Write-PSMMLog -Severity 'INFO' -Message "Filtered to $kept computer(s) matching OS pattern '$OSFilter' ($skipped excluded)." }
+    }
+
+    # GlobalExcludeList -- skip computers matching these patterns (supports wildcards)
     $excludeList = $script:Settings.GlobalExcludeList
     if ($excludeList -and $excludeList.Count -gt 0) {
         $before = $filtered.Count
-        $filtered = @($filtered | Where-Object { $_.Name -notin $excludeList })
+        $filtered = @($filtered | Where-Object {
+            $computerName = $_.Name
+            $shouldExclude = $false
+            foreach ($pattern in $excludeList) {
+                if ($computerName -like $pattern) {
+                    $shouldExclude = $true
+                    break
+                }
+            }
+            -not $shouldExclude
+        })
         $skipped = $before - $filtered.Count
         if ($skipped -gt 0) { Write-PSMMLog -Severity 'INFO' -Message "Excluded $skipped computer(s) via GlobalExcludeList." }
     }
