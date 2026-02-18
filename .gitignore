@@ -40,6 +40,9 @@ $RECYCLE.BIN/
 *.backup
 *~
 
+# Local files
+*local.ps1
+
 # Directories to ignore
 dev/
 test/
