@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     PS-ModuleManager -- A WPF-based PowerShell Module Manager.
 
@@ -547,6 +547,11 @@ function Get-PSMMComputers {
         $results = $searcher.FindAll()
         Write-PSMMLog -Severity 'INFO' -Message "Found $($results.Count) computer(s) in AD."
 
+        # Pre-build GlobalExcludeList for fast lookup inside the loop
+        $excludeList = $script:Settings.GlobalExcludeList
+        $hasExcludeList = $excludeList -and $excludeList.Count -gt 0
+        $excludedCount = 0
+
         foreach ($entry in $results) {
             $props = $entry.Properties
             $name = ($props['cn']  | Select-Object -First 1) -as [string]
@@ -554,6 +559,19 @@ function Get-PSMMComputers {
             $dn = ($props['distinguishedname'] | Select-Object -First 1) -as [string]
             $os = ($props['operatingsystem'] | Select-Object -First 1) -as [string]
             $uac = ($props['useraccountcontrol'] | Select-Object -First 1) -as [int]
+
+            # Skip GlobalExcludeList entries immediately (before reachability check)
+            # Supports wildcards (e.g. "it*", "*vdi*") and exact names
+            if ($hasExcludeList) {
+                $excluded = $false
+                foreach ($pattern in $excludeList) {
+                    if ($name -like $pattern) { $excluded = $true; break }
+                }
+                if ($excluded) {
+                    $excludedCount++
+                    continue
+                }
+            }
 
             # Derive OU from DN
             $ou = if ($dn) {
@@ -584,6 +602,10 @@ function Get-PSMMComputers {
                     OS          = $os
                     Reachable   = $reachable
                 })
+        }
+
+        if ($excludedCount -gt 0) {
+            Write-PSMMLog -Severity 'INFO' -Message "Excluded $excludedCount computer(s) via GlobalExcludeList."
         }
 
         $results.Dispose()
@@ -638,14 +660,8 @@ function Get-PSMMComputers {
         if ($skipped -gt 0) { Write-PSMMLog -Severity 'INFO' -Message "Excluded $skipped virtual device(s) from results." }
     }
 
-    # GlobalExcludeList -- always skip these computer names
-    $excludeList = $script:Settings.GlobalExcludeList
-    if ($excludeList -and $excludeList.Count -gt 0) {
-        $before = $filtered.Count
-        $filtered = @($filtered | Where-Object { $_.Name -notin $excludeList })
-        $skipped = $before - $filtered.Count
-        if ($skipped -gt 0) { Write-PSMMLog -Severity 'INFO' -Message "Excluded $skipped computer(s) via GlobalExcludeList." }
-    }
+    # GlobalExcludeList is now applied early (inside the LDAP results loop)
+    # before reachability checks, so excluded computers are never processed.
 
     return $filtered
 }
