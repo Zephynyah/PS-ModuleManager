@@ -184,7 +184,8 @@ function Get-PSMMDefaultSettings {
         JobTimeoutSeconds = 300
         ExcludeServers    = $false
         ExcludeVirtual    = $false
-        GlobalExcludeList = @()                         # e.g. @('Server1','Server2') - may be $null in PS 5.1
+        OSFilter          = ''                          # e.g. '*Windows 10*' or '*Server 2019*' - wildcards supported
+        GlobalExcludeList = @()                         # e.g. @('Server1','it*','test-*') - wildcards supported, may be $null in PS 5.1
     }
 }
 
@@ -510,7 +511,9 @@ function Get-PSMMComputers {
 
         [bool]$ExcludeServers = $script:Settings.ExcludeServers,
 
-        [bool]$ExcludeVirtual = $script:Settings.ExcludeVirtual
+        [bool]$ExcludeVirtual = $script:Settings.ExcludeVirtual,
+
+        [string]$OSFilter = $script:Settings.OSFilter
     )
 
     Write-PSMMLog -Severity 'INFO' -Message "Querying AD for computers (filter: $NameFilter) ..."
@@ -660,8 +663,14 @@ function Get-PSMMComputers {
         if ($skipped -gt 0) { Write-PSMMLog -Severity 'INFO' -Message "Excluded $skipped virtual device(s) from results." }
     }
 
-    # GlobalExcludeList is now applied early (inside the LDAP results loop)
-    # before reachability checks, so excluded computers are never processed.
+    # GlobalExcludeList -- always skip these computer names
+    $excludeList = $script:Settings.GlobalExcludeList
+    if ($excludeList -and $excludeList.Count -gt 0) {
+        $before = $filtered.Count
+        $filtered = @($filtered | Where-Object { $_.Name -notin $excludeList })
+        $skipped = $before - $filtered.Count
+        if ($skipped -gt 0) { Write-PSMMLog -Severity 'INFO' -Message "Excluded $skipped computer(s) via GlobalExcludeList." }
+    }
 
     return $filtered
 }
@@ -2144,6 +2153,10 @@ $script:SettingsDialogXaml = @'
                           Foreground="#D4D4D4" Margin="0,4"/>
                 <CheckBox Name="ChkExcludeVirtual" Content="Exclude virtual machines by default"
                           Foreground="#D4D4D4" Margin="0,4"/>
+
+                <TextBlock Text="OS Filter (wildcards supported, e.g. '*Windows 10*'):" Foreground="#CCCCCC" Margin="0,12,0,2"/>
+                <TextBox Name="TxtOsFilter" Background="#3C3C3C" Foreground="#D4D4D4"
+                         BorderBrush="#5A5A5A" Padding="4" ToolTip="Filter computers by OS (e.g. '*Windows 10*' or '*Server 2019*'). Leave empty for no filter."/>
             </StackPanel>
         </ScrollViewer>
 
@@ -2963,6 +2976,7 @@ function Show-PSMMSettingsDialog {
     $chkReachability   = $settingsWin.FindName('ChkReachability')
     $chkExclServers    = $settingsWin.FindName('ChkExcludeServers')
     $chkExclVirtual    = $settingsWin.FindName('ChkExcludeVirtual')
+    $txtOsFilter       = $settingsWin.FindName('TxtOsFilter')
     $btnSave           = $settingsWin.FindName('BtnSettSave')
     $btnCancel       = $settingsWin.FindName('BtnSettCancel')
     $btnTestShare    = $settingsWin.FindName('BtnTestShare')
@@ -3004,6 +3018,7 @@ function Show-PSMMSettingsDialog {
     $chkReachability.IsChecked = [bool]$script:Settings.ReachabilityCheck
     $chkExclServers.IsChecked    = [bool]$script:Settings.ExcludeServers
     $chkExclVirtual.IsChecked    = [bool]$script:Settings.ExcludeVirtual
+    $txtOsFilter.Text            = $script:Settings.OSFilter
 
     # Capture module-scoped references as local variables so .GetNewClosure() can see them
     $settings        = $script:Settings          # hashtable reference -- mutations propagate
@@ -3035,6 +3050,7 @@ function Show-PSMMSettingsDialog {
             $settings['ReachabilityCheck'] = [bool]$chkReachability.IsChecked
             $settings['ExcludeServers']    = [bool]$chkExclServers.IsChecked
             $settings['ExcludeVirtual']    = [bool]$chkExclVirtual.IsChecked
+            $settings['OSFilter']          = $txtOsFilter.Text
 
             # Validate
             $issues = & $fnTestSettings -Settings $settings
