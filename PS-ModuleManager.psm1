@@ -520,11 +520,17 @@ function Get-PSMMComputers {
 
         $safeNameFilter = ConvertTo-PSMMLdapSafeString -InputString $NameFilter
         $nameClause = "(cn=$safeNameFilter)"
+
+        $osClause = ''
+        if ($script:Settings.OSFilter) {
+            $osClause = "(operatingSystem=$($script:Settings.OSFilter))"
+        }
+
         if ($EnabledOnly) {
-            $searcher.Filter = "(&(objectCategory=computer)(objectClass=computer)(operatingSystem=$($OSFilter))$nameClause(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
+            $searcher.Filter = "(&(objectCategory=computer)(objectClass=computer)$osClause$nameClause(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
         }
         else {
-            $searcher.Filter = "(&(objectCategory=computer)(objectClass=computer)(operatingSystem=$($OSFilter))$nameClause)"
+            $searcher.Filter = "(&(objectCategory=computer)(objectClass=computer)$osClause$nameClause)"
         }
 
         $searcher.PropertiesToLoad.AddRange(@('cn', 'dnshostname', 'distinguishedname', 'operatingsystem', 'useraccountcontrol'))
@@ -630,14 +636,6 @@ function Get-PSMMComputers {
         $skipped = $before - $filtered.Count
         if ($skipped -gt 0) { Write-PSMMLog -Severity 'INFO' -Message "Excluded $skipped virtual device(s) from results." }
     }
-
-    # if ($OSFilter -and $OSFilter -ne '') {
-    #     $before = $filtered.Count
-    #     $filtered = @($filtered | Where-Object { $_.OS -like $OSFilter })
-    #     $kept = $filtered.Count
-    #     $skipped = $before - $kept
-    #     if ($skipped -gt 0) { Write-PSMMLog -Severity 'INFO' -Message "Filtered to $kept computer(s) matching OS pattern '$OSFilter' ($skipped excluded)." }
-    # }
 
     return $filtered
 }
