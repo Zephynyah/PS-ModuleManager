@@ -4,7 +4,7 @@
     RootModule        = 'PS-ModuleManager.psm1'
 
     # Version number of this module
-    ModuleVersion     = '1.0.0'
+    ModuleVersion     = '2.0.0'
 
     # Unique ID for this module
     GUID              = 'a3f7c8d2-1e4b-4f9a-b6c5-8d2e3f4a5b6c'

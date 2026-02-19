@@ -7,6 +7,13 @@
     inventory installed PowerShell modules, and install / update / remove modules from
     a central network share.  All WPF XAML is defined inline -- no external files needed.
 
+    Architecture: SyncHash + Dispatcher pattern
+      * The WPF window runs on a dedicated STA runspace
+      * A synchronized hashtable ($syncHash) is shared between all runspaces
+      * Background operations (AD queries, inventory, install/update/remove) each spawn
+        their own runspace and update the UI via $syncHash.Window.Dispatcher.Invoke()
+      * ObservableCollections with INotifyPropertyChanged provide automatic WPF data binding
+
     Key capabilities:
       * ADSI computer discovery with OU filtering and wildcard search
       * Parallel remote module inventory via runspace pool
@@ -14,27 +21,27 @@
       * Version comparison with color-coded status (Green / Orange / Red / Gray)
       * Persistent settings (settings.json) with built-in validation
       * Structured logging to file and scrollable UI pane
+      * Thread-safe UI updates via Dispatcher.Invoke() from background runspaces
 
 .NOTES
     Requires: Windows PowerShell 5.1+, .NET Framework 4.5+ (WPF)
     Remoting:  WinRM must be enabled on target computers.
     Author:    PS-ModuleManager Contributors
-    Version:   1.0.0
+    Version:   2.0.0
 #>
 
 #requires -Version 5.1
 
 #region Assembly Loading
-# ─────────────────────────────────────────────────────────────────────────────
-# Load WPF assemblies.  PresentationFramework is typically auto-loaded but we
-# make it explicit for clarity and to ensure availability in all hosts.
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Load WPF assemblies and define data-binding C# classes.
+# ---------------------------------------------------------------------------
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms   # for FolderBrowserDialog fallback
 
-# ── Define WPF-friendly data classes with INotifyPropertyChanged ──────────────
+# -- Define WPF-friendly data classes with INotifyPropertyChanged -------------
 if (-not ([System.Management.Automation.PSTypeName]'ComputerItem').Type) {
     Add-Type -TypeDefinition @"
 using System.ComponentModel;
@@ -127,76 +134,72 @@ public class ModuleGridItem : INotifyPropertyChanged {
 }
 #endregion Assembly Loading
 
-
-
-
 #region Script-Scoped State
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Module-wide variables shared across functions.  Prefixed with $script: to
 # keep them private to the module and avoid polluting the caller's scope.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Default settings path -- next to the module file
+# ---------------------------------------------------------------------------
 $script:ModuleRoot = $PSScriptRoot
 $script:SettingsPath = Join-Path $script:ModuleRoot 'settings.json'
 
 # Runtime state
 $script:Settings = $null   # [hashtable]  loaded from settings.json
-$script:RunspacePool = $null   # [RunspacePool]
-$script:Jobs = [System.Collections.ArrayList]::new()   # active async jobs
-$script:LogEntries = [System.Collections.ArrayList]::new()   # in-memory log buffer
+$script:RunspacePool = $null   # [RunspacePool] for parallel remote ops
+$script:Jobs = [System.Collections.ArrayList]::new()
+$script:LogEntries = [System.Collections.ArrayList]::new()
 $script:Credential = $null   # [PSCredential] when using Prompt/Stored mode
-$script:MainWindow = $null   # WPF Window reference
+
+# SyncHash -- THE central synchronized hashtable shared between the UI runspace
+# and all background worker runspaces.  Every named WPF control is stored here
+# so that background threads can update the UI via Dispatcher.Invoke().
+$script:SyncHash = [hashtable]::Synchronized(@{})
+
+# ObservableCollections for WPF data binding
 $script:ComputerList = [System.Collections.ObjectModel.ObservableCollection[ComputerItem]]::new()
 $script:ModuleGrid = [System.Collections.ObjectModel.ObservableCollection[ModuleGridItem]]::new()
 $script:JobQueue = [System.Collections.ObjectModel.ObservableCollection[PSObject]]::new()
-$script:JobPollerTimer = $null   # active DispatcherTimer for job polling
-$script:CurrentPollerOperation = $null   # current poller operation label (Inventory/Install/Update/Remove)
+
+# Timer references
+$script:JobPollerTimer = $null
+$script:CurrentPollerOperation = $null
 #endregion Script-Scoped State
 
+
 #region Configuration
-# ─────────────────────────────────────────────────────────────────────────────
-# Functions to load, save, validate, and provide defaults for settings.json.
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Settings management: defaults, import, export, validation.
+# ---------------------------------------------------------------------------
 
 function Get-PSMMDefaultSettings {
     <#
     .SYNOPSIS
-        Returns a hashtable with all default settings.
-    .DESCRIPTION
-        Provides sensible defaults so the application can start even without
-        an existing settings.json.  Every key used elsewhere in the module
-        must be represented here.
-    .OUTPUTS
-        [hashtable]
+        Returns a hashtable of sensible default settings.
     #>
     return @{
-        DomainLdapPath    = ''                          # e.g. 'LDAP://DC=corp,DC=local'
-        OuFilter          = ''                          # e.g. 'OU=Servers,DC=corp,DC=local'
+        DomainLdapPath    = ''
+        OuFilter          = ''
         ModuleSearchPaths = @('C:\Program Files\WindowsPowerShell\Modules')
-        CentralSharePath  = ''                          # e.g. '\\fileserver\PSModules'
+        CentralSharePath  = ''
         MaxConcurrency    = [Math]::Min(4, [Environment]::ProcessorCount)
-        CredentialMode    = 'Default'                   # Default | Prompt | Stored
+        CredentialMode    = 'Default'
         LogPath           = Join-Path $script:ModuleRoot 'logs'
-        LogLevel          = 'INFO'                      # DEBUG | INFO | WARN | ERROR
+        LogLevel          = 'INFO'
         RetryCount        = 2
         ReachabilityCheck = $true
         JobTimeoutSeconds = 300
         ExcludeServers    = $false
         ExcludeVirtual    = $false
-        OSFilter          = ''                          # e.g. '*Windows 10*' or '*Server 2019*' - wildcards supported
-        GlobalExcludeList = @()                         # e.g. @('Server1','it*','test-*') - wildcards supported, may be $null in PS 5.1
+        OSFilter          = ''
+        GlobalExcludeList = @()
     }
 }
 
 function Import-PSMMSettings {
     <#
     .SYNOPSIS
-        Loads settings from the JSON file, merging with defaults.
+        Loads settings from a JSON file, falling back to defaults for missing keys.
     .PARAMETER Path
-        Full path to the settings.json file.  Falls back to the module-root copy.
-    .OUTPUTS
-        [hashtable] -- the merged settings object.
+        Path to the settings JSON file.
     #>
     [CmdletBinding()]
     param(
@@ -208,7 +211,6 @@ function Import-PSMMSettings {
     if (Test-Path -LiteralPath $Path) {
         try {
             $json = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json
-            # Merge: JSON values override defaults
             foreach ($key in @($defaults.Keys)) {
                 if ($null -ne $json.$key) {
                     $defaults[$key] = $json.$key
@@ -222,7 +224,6 @@ function Import-PSMMSettings {
     }
     else {
         Write-PSMMLog -Severity 'WARN' -Message "Settings file not found at $Path -- using defaults."
-        # Create default file for the user
         Export-PSMMSettings -Settings $defaults -Path $Path
     }
 
@@ -233,11 +234,7 @@ function Import-PSMMSettings {
 function Export-PSMMSettings {
     <#
     .SYNOPSIS
-        Persists the settings hashtable to a JSON file.
-    .PARAMETER Settings
-        The settings hashtable to save.
-    .PARAMETER Path
-        Destination file path.
+        Saves settings hashtable to a JSON file.
     #>
     [CmdletBinding()]
     param(
@@ -259,9 +256,7 @@ function Export-PSMMSettings {
 function Test-PSMMSettings {
     <#
     .SYNOPSIS
-        Validates the current settings and returns a list of issues.
-    .OUTPUTS
-        [string[]] -- array of validation error messages (empty = valid).
+        Validates settings and returns an array of issue strings.
     #>
     [CmdletBinding()]
     param(
@@ -294,21 +289,23 @@ function Test-PSMMSettings {
 }
 #endregion Configuration
 
+
 #region Logging
-# ─────────────────────────────────────────────────────────────────────────────
-# Structured logging to file and (optionally) the WPF log pane.
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Structured logging to file, in-memory buffer, and WPF log pane.
+# Uses $script:SyncHash for thread-safe UI updates via Dispatcher.
+# ---------------------------------------------------------------------------
 
 function Write-PSMMLog {
     <#
     .SYNOPSIS
-        Writes a structured log entry to file and the UI log pane.
+        Logs a message to file, memory buffer, and the WPF log pane (via Dispatcher).
     .PARAMETER Severity
         Log level: DEBUG, INFO, WARN, or ERROR.
     .PARAMETER Message
         The log message text.
     .PARAMETER ComputerName
-        Optional target computer associated with the entry.
+        Optional computer context for the log entry.
     #>
     [CmdletBinding()]
     param(
@@ -321,7 +318,6 @@ function Write-PSMMLog {
         [string]$ComputerName = ''
     )
 
-    # Determine configured minimum severity
     $levelMap = @{ 'DEBUG' = 0; 'INFO' = 1; 'WARN' = 2; 'ERROR' = 3 }
     $configuredLevel = if ($script:Settings.LogLevel) { $script:Settings.LogLevel } else { 'INFO' }
     $minLevel = $levelMap[$configuredLevel]
@@ -351,20 +347,22 @@ function Write-PSMMLog {
     }
     catch { <# silently ignore file logging failures #> }
 
-    # WPF pane update (dispatcher-safe)
-    if ($script:MainWindow -and $script:MainWindow.Dispatcher) {
+    # WPF pane update via SyncHash + Dispatcher (thread-safe from ANY runspace)
+    if ($script:SyncHash.Window -and $script:SyncHash.Window.Dispatcher) {
         try {
-            $script:MainWindow.Dispatcher.Invoke([Action] {
-                    $logBox = $script:MainWindow.FindName('LogListBox')
-                    if ($logBox) {
-                        $logBox.Items.Add($line)
-                        $logBox.ScrollIntoView($logBox.Items[$logBox.Items.Count - 1])
+            $capturedLine = $line
+            $capturedMsg = $Message
+            $sh = $script:SyncHash
+            $sh.Window.Dispatcher.Invoke(
+                [Action] {
+                    if ($sh.LogListBox) {
+                        $sh.LogListBox.Items.Add($capturedLine)
+                        $sh.LogListBox.ScrollIntoView($sh.LogListBox.Items[$sh.LogListBox.Items.Count - 1])
                     }
-
-                    # Also update status bar
-                    $statusText = $script:MainWindow.FindName('StatusText')
-                    if ($statusText) { $statusText.Text = $Message }
-                }, [System.Windows.Threading.DispatcherPriority]::Background)
+                    if ($sh.StatusText) { $sh.StatusText.Text = $capturedMsg }
+                },
+                [System.Windows.Threading.DispatcherPriority]::Background
+            )
         }
         catch { <# dispatcher may not be ready yet #> }
     }
@@ -373,65 +371,52 @@ function Write-PSMMLog {
 function Invoke-PSMMLogRotation {
     <#
     .SYNOPSIS
-        Removes log files older than the specified retention period.
-    .DESCRIPTION
-        Scans the configured log directory for PS-ModuleManager_*.log files
-        and deletes any older than RetentionDays (default 30).  Also enforces
-        a maximum total log directory size (default 10 MB).
+        Removes old log files and enforces a total size cap.
     .PARAMETER LogPath
-        Path to the log directory.  If not specified, uses $script:Settings.LogPath.
+        Directory containing log files.
     .PARAMETER RetentionDays
-        Number of days to retain log files.  Files older than this are deleted.
+        Files older than this are deleted.  Default: 30.
     .PARAMETER MaxTotalSizeMB
-        Maximum total size (in MB) of all log files.  Oldest files are removed
-        first until the total is under the limit.
+        Maximum total size of all log files.  Default: 10.
     #>
     [CmdletBinding()]
     param(
-        [string]$LogPath,
+        [string]$LogPath = $(if ($script:Settings.LogPath) { $script:Settings.LogPath } else { Join-Path $script:ModuleRoot 'logs' }),
         [int]$RetentionDays = 30,
         [int]$MaxTotalSizeMB = 10
     )
 
-    $logDir = if ($LogPath) { $LogPath } elseif ($script:Settings.LogPath) { $script:Settings.LogPath } else { Join-Path $script:ModuleRoot 'logs' }
-    if (-not (Test-Path -LiteralPath $logDir)) { return }
-
-    $logFiles = Get-ChildItem -LiteralPath $logDir -Filter 'PS-ModuleManager_*.log' -File -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime
-
-    if (-not $logFiles -or $logFiles.Count -eq 0) { return }
+    if (-not (Test-Path $LogPath)) { return }
 
     $cutoff = (Get-Date).AddDays(-$RetentionDays)
+    $logFiles = Get-ChildItem -LiteralPath $LogPath -Filter '*.log' -File -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime
+
     $removed = 0
 
-    # Remove files older than retention period
+    # Remove files older than retention
     foreach ($f in $logFiles) {
         if ($f.LastWriteTime -lt $cutoff) {
-            try {
-                Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
-                $removed++
-            }
-            catch { <# ignore individual file deletion failures #> }
+            try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; $removed++ }
+            catch { <# skip #> }
         }
     }
 
-    # Re-enumerate after age-based cleanup
-    $logFiles = Get-ChildItem -LiteralPath $logDir -Filter 'PS-ModuleManager_*.log' -File -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime
+    # Enforce total size cap
+    $remaining = Get-ChildItem -LiteralPath $LogPath -Filter '*.log' -File -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime
+    $totalBytes = ($remaining | Measure-Object -Property Length -Sum).Sum
+    $maxBytes = $MaxTotalSizeMB * 1MB
 
-    # Enforce size limit (remove oldest first)
-    if ($logFiles) {
-        $totalBytes = ($logFiles | Measure-Object -Property Length -Sum).Sum
-        $maxBytes = $MaxTotalSizeMB * 1MB
-        $idx = 0
-        while ($totalBytes -gt $maxBytes -and $idx -lt $logFiles.Count) {
+    if ($totalBytes -gt $maxBytes) {
+        foreach ($f in $remaining) {
+            if ($totalBytes -le $maxBytes) { break }
             try {
-                $totalBytes -= $logFiles[$idx].Length
-                Remove-Item -LiteralPath $logFiles[$idx].FullName -Force -ErrorAction Stop
+                $totalBytes -= $f.Length
+                Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
                 $removed++
             }
-            catch { <# ignore #> }
-            $idx++
+            catch { <# skip #> }
         }
     }
 
@@ -441,11 +426,12 @@ function Invoke-PSMMLogRotation {
 }
 #endregion Logging
 
+
 #region ADSI Service
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Active Directory computer discovery using raw ADSI / DirectorySearcher.
 # No RSAT or ActiveDirectory module required.
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 function ConvertTo-PSMMLdapSafeString {
     <#
@@ -454,12 +440,10 @@ function ConvertTo-PSMMLdapSafeString {
     .DESCRIPTION
         Sanitizes input to prevent LDAP injection by escaping RFC 4515 special
         characters: backslash, parentheses, NUL, and optionally asterisk.
-        Wildcard asterisks used for LDAP name filters are preserved by default.
     .PARAMETER InputString
         The raw user input to sanitize.
     .PARAMETER EscapeWildcard
-        If $true, also escapes the asterisk character. Default is $false to
-        allow LDAP wildcard searches like '*web*'.
+        If $true, also escapes the asterisk character. Default is $false.
     .OUTPUTS
         [string] -- the escaped string safe for LDAP filter insertion.
     #>
@@ -492,13 +476,19 @@ function Get-PSMMComputers {
         Uses System.DirectoryServices.DirectorySearcher to find computer objects.
         Supports OU scoping, name wildcard filter, and enabled-only toggle.
     .PARAMETER LdapPath
-        The LDAP path to search from. e.g. 'LDAP://OU=Servers,DC=corp,DC=local'
+        The LDAP path to search from.
     .PARAMETER NameFilter
-        Wildcard filter for computer names (e.g. 'WEB*').  Default: '*' (all).
+        Wildcard filter for computer names.  Default: '*' (all).
     .PARAMETER EnabledOnly
         If $true, only returns enabled computer accounts.
     .PARAMETER TestReachability
         If $true, tests WinRM reachability on each discovered computer.
+    .PARAMETER ExcludeServers
+        If $true, excludes computers with Server OS.
+    .PARAMETER ExcludeVirtual
+        If $true, excludes virtual machines.
+    .PARAMETER OSFilter
+        Wildcard filter for OS.
     .OUTPUTS
         [PSCustomObject[]] -- ComputerInfo objects.
     #>
@@ -508,11 +498,8 @@ function Get-PSMMComputers {
         [string]$NameFilter = '*',
         [bool]$EnabledOnly = $true,
         [bool]$TestReachability = $script:Settings.ReachabilityCheck,
-
         [bool]$ExcludeServers = $script:Settings.ExcludeServers,
-
         [bool]$ExcludeVirtual = $script:Settings.ExcludeVirtual,
-
         [string]$OSFilter = $script:Settings.OSFilter
     )
 
@@ -521,28 +508,23 @@ function Get-PSMMComputers {
     $computers = [System.Collections.ArrayList]::new()
 
     try {
-        # Build the ADSI searcher
         if ($LdapPath) {
             $root = [ADSI]$LdapPath
         }
         else {
-            # Default: current domain root
             $root = [ADSI]''
         }
 
         $searcher = [System.DirectoryServices.DirectorySearcher]::new($root)
         $searcher.PageSize = 1000
 
-        # Sanitize user-provided name filter to prevent LDAP injection
         $safeNameFilter = ConvertTo-PSMMLdapSafeString -InputString $NameFilter
-        # LDAP filter
         $nameClause = "(cn=$safeNameFilter)"
         if ($EnabledOnly) {
-            # userAccountControl bit 2 = ACCOUNTDISABLE
-            $searcher.Filter = "(&(objectCategory=computer)(objectClass=computer)$nameClause(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
+            $searcher.Filter = "(&(objectCategory=computer)(objectClass=computer)(operatingSystem=$($OSFilter))$nameClause(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
         }
         else {
-            $searcher.Filter = "(&(objectCategory=computer)(objectClass=computer)$nameClause)"
+            $searcher.Filter = "(&(objectCategory=computer)(objectClass=computer)(operatingSystem=$($OSFilter))$nameClause)"
         }
 
         $searcher.PropertiesToLoad.AddRange(@('cn', 'dnshostname', 'distinguishedname', 'operatingsystem', 'useraccountcontrol'))
@@ -550,7 +532,7 @@ function Get-PSMMComputers {
         $results = $searcher.FindAll()
         Write-PSMMLog -Severity 'INFO' -Message "Found $($results.Count) computer(s) in AD."
 
-        # Pre-build GlobalExcludeList for fast lookup inside the loop
+        # Pre-build GlobalExcludeList for fast lookup
         $excludeList = $script:Settings.GlobalExcludeList
         $hasExcludeList = $excludeList -and $excludeList.Count -gt 0
         $excludedCount = 0
@@ -563,28 +545,18 @@ function Get-PSMMComputers {
             $os = ($props['operatingsystem'] | Select-Object -First 1) -as [string]
             $uac = ($props['useraccountcontrol'] | Select-Object -First 1) -as [int]
 
-            # Skip GlobalExcludeList entries immediately (before reachability check)
-            # Supports wildcards (e.g. "it*", "*vdi*") and exact names
+            # Skip GlobalExcludeList entries
             if ($hasExcludeList) {
                 $excluded = $false
                 foreach ($pattern in $excludeList) {
                     if ($name -like $pattern) { $excluded = $true; break }
                 }
-                if ($excluded) {
-                    $excludedCount++
-                    continue
-                }
+                if ($excluded) { $excludedCount++; continue }
             }
 
-            # Derive OU from DN
-            $ou = if ($dn) {
-                ($dn -split ',', 2)[1]
-            }
-            else { '' }
-
+            $ou = if ($dn) { ($dn -split ',', 2)[1] } else { '' }
             $enabled = -not ($uac -band 2)
 
-            # Optionally test reachability
             $reachable = $null
             if ($TestReachability -and $dns) {
                 try {
@@ -617,19 +589,15 @@ function Get-PSMMComputers {
     catch {
         Write-PSMMLog -Severity 'WARN' -Message "AD query failed: $_  -- falling back to local computer."
 
-        # Fallback: add the local computer so the tool remains usable off-domain
         $localName = $env:COMPUTERNAME
-        $localDns  = try { [System.Net.Dns]::GetHostEntry('').HostName } catch { $localName }
-        $ComputerSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
-        $localOS   = $ComputerSystem.Caption
-        $localModel = $ComputerSystem.Model
+        $localDns = try { [System.Net.Dns]::GetHostEntry('').HostName } catch { $localName }
+        $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
+        $localOS = $cs.Caption
+        $localModel = $cs.Model
 
         $reachable = $null
         if ($TestReachability) {
-            try {
-                $null = Test-WSMan -ComputerName $localDns -ErrorAction Stop
-                $reachable = $true
-            }
+            try { $null = Test-WSMan -ComputerName $localDns -ErrorAction Stop; $reachable = $true }
             catch { $reachable = $false }
         }
 
@@ -646,7 +614,7 @@ function Get-PSMMComputers {
         Write-PSMMLog -Severity 'INFO' -Message "Added local computer '$localName' as fallback."
     }
 
-    # ── Post-filter: exclude servers and virtual devices ─────────────────
+    # Post-filter
     $filtered = $computers.ToArray()
 
     if ($ExcludeServers) {
@@ -663,49 +631,30 @@ function Get-PSMMComputers {
         if ($skipped -gt 0) { Write-PSMMLog -Severity 'INFO' -Message "Excluded $skipped virtual device(s) from results." }
     }
 
-    # OS Filter -- include only computers whose OS matches the pattern
-    if ($OSFilter -and $OSFilter -ne '') {
-        $before = $filtered.Count
-        $filtered = @($filtered | Where-Object { $_.OS -like $OSFilter })
-        $kept = $filtered.Count
-        $skipped = $before - $kept
-        if ($skipped -gt 0) { Write-PSMMLog -Severity 'INFO' -Message "Filtered to $kept computer(s) matching OS pattern '$OSFilter' ($skipped excluded)." }
-    }
-
-    # GlobalExcludeList -- skip computers matching these patterns (supports wildcards)
-    # $excludeList = $script:Settings.GlobalExcludeList
-    # if ($excludeList -and $excludeList.Count -gt 0) {
+    # if ($OSFilter -and $OSFilter -ne '') {
     #     $before = $filtered.Count
-    #     $filtered = @($filtered | Where-Object {
-    #         $computerName = $_.Name
-    #         $shouldExclude = $false
-    #         foreach ($pattern in $excludeList) {
-    #             if ($computerName -like $pattern) {
-    #                 $shouldExclude = $true
-    #                 break
-    #             }
-    #         }
-    #         -not $shouldExclude
-    #     })
-    #     $skipped = $before - $filtered.Count
-    #     if ($skipped -gt 0) { Write-PSMMLog -Severity 'INFO' -Message "Excluded $skipped computer(s) via GlobalExcludeList." }
+    #     $filtered = @($filtered | Where-Object { $_.OS -like $OSFilter })
+    #     $kept = $filtered.Count
+    #     $skipped = $before - $kept
+    #     if ($skipped -gt 0) { Write-PSMMLog -Severity 'INFO' -Message "Filtered to $kept computer(s) matching OS pattern '$OSFilter' ($skipped excluded)." }
     # }
 
     return $filtered
 }
 #endregion ADSI Service
 
+
 #region Runspace Pool
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Shared runspace pool for parallel remote operations.
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 function New-PSMMRunspacePool {
     <#
     .SYNOPSIS
         Creates and opens a runspace pool with the configured concurrency.
     .PARAMETER MaxRunspaces
-        Maximum number of concurrent runspaces.  Defaults to settings value.
+        Maximum number of concurrent runspaces.
     .OUTPUTS
         [System.Management.Automation.Runspaces.RunspacePool]
     #>
@@ -731,8 +680,7 @@ function Invoke-PSMMParallel {
     .SYNOPSIS
         Submits a script block to the runspace pool for a list of computers.
     .DESCRIPTION
-        Queues one PowerShell instance per computer and returns job tracking
-        objects that can be polled for completion.
+        Queues one PowerShell instance per computer and returns job tracking objects.
     .PARAMETER ComputerNames
         Array of computer DNS names or NetBIOS names to target.
     .PARAMETER ScriptBlock
@@ -795,11 +743,6 @@ function Receive-PSMMJobs {
     <#
     .SYNOPSIS
         Polls all active jobs and collects completed results.
-    .DESCRIPTION
-        Iterates over $script:Jobs, checks IsCompleted, and harvests results.
-        Completed jobs are marked and their PowerShell instances disposed.
-    .OUTPUTS
-        [PSCustomObject[]] -- completed job objects with results populated.
     #>
     [CmdletBinding()]
     param()
@@ -830,12 +773,11 @@ function Receive-PSMMJobs {
                         $errMsg = ($job.PowerShell.Streams.Warning | ForEach-Object { $_.ToString() }) -join '; '
                     }
                     if (-not $errMsg -and $job.Result) {
-                        # Check if the result contains an _ERROR_ marker from the inventory script
                         $errorResult = $job.Result | Where-Object { $_.ModuleName -eq '_ERROR_' } | Select-Object -First 1
                         if ($errorResult) { $errMsg = $errorResult.ModuleBase }
                     }
                     if (-not $errMsg) { $errMsg = 'Unknown error (no details captured).' }
-                    $job.Error  = $errMsg
+                    $job.Error = $errMsg
                     $job.Status = 'Failed'
                     Write-PSMMLog -Severity 'ERROR' -Message "Job $($job.Id) failed: $($job.Error)" -ComputerName $job.ComputerName
                 }
@@ -906,27 +848,24 @@ function Close-PSMMRunspacePool {
 }
 #endregion Runspace Pool
 
+
 #region Module Inventory
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Query installed modules locally or remotely and compare against central share.
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 function Get-PSMMRemoteModules {
     <#
     .SYNOPSIS
         Retrieves installed PowerShell modules from one or more remote computers.
-    .DESCRIPTION
-        Uses Invoke-Command (via the runspace pool) to run Get-Module -ListAvailable
-        on each target.  When ModuleName is specified, only that module is queried;
-        otherwise all modules are returned.
     .PARAMETER ComputerNames
         Array of computer names to query.
     .PARAMETER ModuleName
-        Optional module name to filter on.  If specified, only that module is inventoried.
+        Optional module name to filter on.
     .PARAMETER Credential
         Optional PSCredential for remoting.
     .OUTPUTS
-        [PSCustomObject[]] -- ModuleInfo objects.
+        [PSCustomObject[]] -- Job descriptors from the runspace pool.
     #>
     [CmdletBinding()]
     param(
@@ -940,7 +879,8 @@ function Get-PSMMRemoteModules {
 
     if ($ModuleName) {
         Write-PSMMLog -Severity 'INFO' -Message "Inventorying module '$ModuleName' on $($ComputerNames.Count) computer(s) ..."
-    } else {
+    }
+    else {
         Write-PSMMLog -Severity 'INFO' -Message "Inventorying all modules on $($ComputerNames.Count) computer(s) ..."
     }
 
@@ -949,11 +889,11 @@ function Get-PSMMRemoteModules {
         try {
             if ($ModFilter) {
                 $sb = [scriptblock]::Create("Get-Module -ListAvailable -Name '$ModFilter' | Select-Object Name, @{N = 'Version'; E = { `$_.Version.ToString() } }, ModuleBase")
-            } else {
+            }
+            else {
                 $sb = { Get-Module -ListAvailable | Select-Object Name, @{N = 'Version'; E = { $_.Version.ToString() } }, ModuleBase }
             }
 
-            # Gather Model and OS info
             $sysInfoSb = {
                 $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
                 $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
@@ -965,10 +905,10 @@ function Get-PSMMRemoteModules {
 
             $isLocal = ($Computer -eq $env:COMPUTERNAME) -or ($Computer -eq 'localhost') -or ($Computer -eq '.')
             if ($isLocal) {
-                # Run locally -- no WinRM needed
-                $modules  = & $sb
-                $sysInfo  = & $sysInfoSb
-            } else {
+                $modules = & $sb
+                $sysInfo = & $sysInfoSb
+            }
+            else {
                 $splat = @{ ComputerName = $Computer; ScriptBlock = $sb }
                 if ($Cred) { $splat['Credential'] = $Cred }
                 $modules = Invoke-Command @splat -ErrorAction Stop
@@ -982,7 +922,6 @@ function Get-PSMMRemoteModules {
             $osCaption = if ($sysInfo) { $sysInfo.OS } else { '' }
 
             if ($ModFilter -and -not $modules) {
-                # Module not found on remote computer -- return explicit 'Not Installed' entry
                 [PSCustomObject]@{
                     ComputerName     = $Computer
                     ModuleName       = $ModFilter
@@ -991,7 +930,8 @@ function Get-PSMMRemoteModules {
                     Model            = $model
                     OS               = $osCaption
                 }
-            } else {
+            }
+            else {
                 foreach ($m in $modules) {
                     [PSCustomObject]@{
                         ComputerName     = $Computer
@@ -1026,7 +966,6 @@ function Get-PSMMShareModules {
         Lists modules and versions available on the central network share.
     .DESCRIPTION
         Expects share structure: <CentralSharePath>\<ModuleName>\<Version>\
-        Each version folder should contain the module files (or a ZIP).
     .OUTPUTS
         [PSCustomObject[]] -- objects with ModuleName, Version, Path.
     #>
@@ -1087,9 +1026,7 @@ function Compare-PSMMModuleVersions {
                 $latestOnShare[$sm.ModuleName] = $sm.Version
             }
         }
-        catch {
-            # Non-parseable version string -- skip
-        }
+        catch { <# Non-parseable version string -- skip #> }
     }
 
     $results = foreach ($mod in $InstalledModules) {
@@ -1128,24 +1065,22 @@ function Compare-PSMMModuleVersions {
 }
 #endregion Module Inventory
 
+
 #region Module Deployment
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Install, update, and remove modules on remote computers.
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 function Get-PSMMModuleDependencies {
     <#
     .SYNOPSIS
         Reads the .psd1 manifest from a share module folder and returns RequiredModules.
-    .DESCRIPTION
-        Looks for a .psd1 file in the specified module source path, parses it
-        with Import-PowerShellDataFile, and returns any RequiredModules entries.
     .PARAMETER SourcePath
         The path to the module version folder on the central share.
     .PARAMETER ModuleName
-        The name of the module (used to locate the .psd1 file).
+        The name of the module.
     .OUTPUTS
-        [PSCustomObject[]] with ModuleName and optionally ModuleVersion for each dependency.
+        [PSCustomObject[]] with ModuleName and optionally ModuleVersion.
     #>
     [CmdletBinding()]
     param(
@@ -1159,7 +1094,6 @@ function Get-PSMMModuleDependencies {
     $deps = @()
     $psd1 = Join-Path $SourcePath "$ModuleName.psd1"
     if (-not (Test-Path -LiteralPath $psd1)) {
-        # Try finding any .psd1 in the folder
         $psd1File = Get-ChildItem -LiteralPath $SourcePath -Filter '*.psd1' -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($psd1File) { $psd1 = $psd1File.FullName } else { return $deps }
     }
@@ -1191,9 +1125,6 @@ function Install-PSMMModule {
     <#
     .SYNOPSIS
         Installs a module from the central share to one or more remote computers.
-    .DESCRIPTION
-        Copies the module version folder (or extracts ZIP) to the target computer's
-        PowerShell module path and validates with Import-Module.
     .PARAMETER ComputerNames
         Target computers.
     .PARAMETER ModuleName
@@ -1224,7 +1155,6 @@ function Install-PSMMModule {
         return
     }
 
-    # Resolve latest version if not specified
     if (-not $Version) {
         $versions = Get-ChildItem -LiteralPath (Join-Path $sharePath $ModuleName) -Directory -ErrorAction SilentlyContinue |
         Sort-Object { try { [Version]$_.Name } catch { [Version]'0.0' } } -Descending
@@ -1247,8 +1177,8 @@ function Install-PSMMModule {
     $dependencies = Get-PSMMModuleDependencies -SourcePath $sourcePath -ModuleName $ModuleName
     if ($dependencies.Count -gt 0) {
         $depNames = ($dependencies | ForEach-Object {
-            if ($_.ModuleVersion) { "$($_.ModuleName) v$($_.ModuleVersion)+" } else { $_.ModuleName }
-        }) -join ', '
+                if ($_.ModuleVersion) { "$($_.ModuleName) v$($_.ModuleVersion)+" } else { $_.ModuleName }
+            }) -join ', '
         Write-PSMMLog -Severity 'WARN' -Message "Module '$ModuleName' requires: $depNames -- verify these are installed on target computers."
     }
 
@@ -1257,7 +1187,6 @@ function Install-PSMMModule {
     $installScript = {
         param($Computer, $Cred, $ModName, $Ver, $Source)
         try {
-            # Scriptblock that runs locally on the target machine using a local staging path
             $innerSb = {
                 param($ModName, $Ver, $StagingPath)
                 $destRoot = Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'
@@ -1267,25 +1196,20 @@ function Install-PSMMModule {
                     New-Item -ItemType Directory -Path $destPath -Force | Out-Null
                 }
 
-                # Check for ZIP or folder in the local staging path
                 $zipFile = Get-ChildItem -LiteralPath $StagingPath -Filter '*.zip' -ErrorAction SilentlyContinue | Select-Object -First 1
                 if ($zipFile) {
-                    # Extract to a temp directory first to handle ZIPs with a wrapper folder
                     $tempExtract = Join-Path $env:TEMP "PSMMExtract_$ModName_$Ver_$([guid]::NewGuid().ToString('N'))"
                     New-Item -ItemType Directory -Path $tempExtract -Force | Out-Null
                     try {
                         Add-Type -AssemblyName System.IO.Compression.FileSystem
                         [System.IO.Compression.ZipFile]::ExtractToDirectory($zipFile.FullName, $tempExtract)
 
-                        # Detect wrapper folder: if extraction produced a single subfolder and no files at root, unwrap it
-                        $extractedDirs  = Get-ChildItem -LiteralPath $tempExtract -Directory -ErrorAction SilentlyContinue
+                        $extractedDirs = Get-ChildItem -LiteralPath $tempExtract -Directory -ErrorAction SilentlyContinue
                         $extractedFiles = Get-ChildItem -LiteralPath $tempExtract -File -ErrorAction SilentlyContinue
                         if ($extractedDirs.Count -eq 1 -and $extractedFiles.Count -eq 0) {
-                            # Single wrapper folder -- copy its contents directly into destination
                             Copy-Item -Path (Join-Path $extractedDirs[0].FullName '*') -Destination $destPath -Recurse -Force
                         }
                         else {
-                            # No wrapper -- copy everything as-is
                             Copy-Item -Path "$tempExtract\*" -Destination $destPath -Recurse -Force
                         }
                     }
@@ -1294,11 +1218,9 @@ function Install-PSMMModule {
                     }
                 }
                 else {
-                    # Folder-based: copy loose module files directly
                     Copy-Item -Path "$StagingPath\*" -Destination $destPath -Recurse -Force
                 }
 
-                # Validate
                 $loaded = Get-Module -ListAvailable -Name $ModName | Where-Object { $_.Version.ToString() -eq $Ver }
                 if ($loaded) {
                     "SUCCESS: $ModName v$Ver installed on $env:COMPUTERNAME"
@@ -1310,30 +1232,24 @@ function Install-PSMMModule {
 
             $isLocal = ($Computer -eq $env:COMPUTERNAME) -or ($Computer -eq 'localhost') -or ($Computer -eq '.')
             if ($isLocal) {
-                # Local install -- source is directly accessible
                 & $innerSb $ModName $Ver $Source
             }
             else {
-                # Remote install -- stage source files onto the remote PC first to avoid double-hop
                 $session = $null
                 try {
                     $sessionSplat = @{ ComputerName = $Computer; ErrorAction = 'Stop' }
                     if ($Cred) { $sessionSplat['Credential'] = $Cred }
                     $session = New-PSSession @sessionSplat
 
-                    # Create a temp staging directory on the remote machine
                     $remoteStagingPath = Invoke-Command -Session $session -ScriptBlock {
                         $p = Join-Path $env:TEMP "PSMMStaging_$([guid]::NewGuid().ToString('N'))"
                         New-Item -ItemType Directory -Path $p -Force | ForEach-Object { $_.FullName }
                     }
 
-                    # Copy source files from the share to the remote staging directory
                     Copy-Item -Path "$Source\*" -Destination $remoteStagingPath -ToSession $session -Recurse -Force
 
-                    # Run the install logic using the local staging path (no double-hop)
                     Invoke-Command -Session $session -ScriptBlock $innerSb -ArgumentList @($ModName, $Ver, $remoteStagingPath)
 
-                    # Clean up staging directory on remote machine
                     Invoke-Command -Session $session -ScriptBlock {
                         param($p)
                         Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue
@@ -1362,11 +1278,9 @@ function Uninstall-PSMMModule {
     .PARAMETER ModuleName
         Name of the module to remove.
     .PARAMETER Version
-        Specific version to remove.  If omitted, removes all versions.
+        Specific version to remove.
     .PARAMETER ModulePath
-        The actual path (PSModulePath / ModuleBase) where the module is installed.
-        When provided, this exact path is removed instead of guessing from the
-        default ProgramFiles location.
+        The actual path where the module is installed.
     .PARAMETER Credential
         Optional PSCredential for remoting.
     .OUTPUTS
@@ -1394,15 +1308,12 @@ function Uninstall-PSMMModule {
         try {
             $innerSb = {
                 param($ModName, $Ver, $KnownPath)
-                # Unload if loaded
                 Remove-Module -Name $ModName -Force -ErrorAction SilentlyContinue
 
-                # Use the known path from inventory if available
                 if ($KnownPath -and (Test-Path $KnownPath)) {
                     $target = $KnownPath
                 }
                 else {
-                    # Fallback: try standard ProgramFiles location
                     $destRoot = Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'
                     if ($Ver) {
                         $target = Join-Path $destRoot "$ModName\$Ver"
@@ -1424,7 +1335,8 @@ function Uninstall-PSMMModule {
             $isLocal = ($Computer -eq $env:COMPUTERNAME) -or ($Computer -eq 'localhost') -or ($Computer -eq '.')
             if ($isLocal) {
                 & $innerSb $ModName $Ver $KnownPath
-            } else {
+            }
+            else {
                 $splat = @{
                     ComputerName = $Computer
                     ErrorAction  = 'Stop'
@@ -1445,10 +1357,170 @@ function Uninstall-PSMMModule {
 }
 #endregion Module Deployment
 
+
 #region Credential Management
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Credential handling based on configured CredentialMode.
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+function Show-PSMMCredentialDialog {
+    <#
+    .SYNOPSIS
+        Shows a custom WPF credential dialog (dark-themed, no WinForms dependency).
+    .DESCRIPTION
+        Replaces Get-Credential with a pure-WPF dialog that runs safely on the
+        WPF dispatcher thread without deadlocking.
+    .PARAMETER Message
+        Prompt message shown in the dialog.
+    .PARAMETER Owner
+        Optional owner window for modal centering.
+    .OUTPUTS
+        [PSCredential] or $null if cancelled.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Message = 'Enter credentials for remote operations',
+        [System.Windows.Window]$Owner = $null
+    )
+
+    $credXaml = @"
+<Window
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Credentials"
+    Width="420" Height="260"
+    WindowStartupLocation="CenterOwner"
+    ResizeMode="NoResize"
+    Background="#1E1E1E"
+    Foreground="#D4D4D4"
+    FontFamily="Segoe UI"
+    FontSize="13">
+    <Window.Resources>
+        <Style TargetType="Button">
+            <Setter Property="Background"  Value="#0E639C"/>
+            <Setter Property="Foreground"  Value="White"/>
+            <Setter Property="BorderBrush" Value="#1177BB"/>
+            <Setter Property="Padding"     Value="14,7"/>
+            <Setter Property="Margin"      Value="5"/>
+            <Setter Property="Cursor"      Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="1" CornerRadius="3"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="#1177BB"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style TargetType="TextBox">
+            <Setter Property="Background"  Value="#3C3C3C"/>
+            <Setter Property="Foreground"  Value="#D4D4D4"/>
+            <Setter Property="BorderBrush" Value="#555555"/>
+            <Setter Property="Padding"     Value="5,4"/>
+        </Style>
+        <!-- CheckBox Dark Theme -->
+        <Style TargetType="CheckBox">
+            <Setter Property="Foreground" Value="#D4D4D4"/>
+            <Setter Property="Background" Value="#3C3C3C"/>
+            <Setter Property="BorderBrush" Value="#555555"/>
+            <Setter Property="Margin" Value="0,2"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="CheckBox">
+                        <BulletDecorator Background="Transparent">
+                            <BulletDecorator.Bullet>
+                                <Grid Width="16" Height="16">
+                                    <Border x:Name="Border" Background="#3C3C3C" BorderBrush="#555555" BorderThickness="1" CornerRadius="2"/>
+                                    <Path x:Name="CheckMark" Data="M 2 6 L 6 10 L 13 2" Stroke="#4EC9B0" StrokeThickness="2" Visibility="Collapsed" Margin="1"/>
+                                </Grid>
+                            </BulletDecorator.Bullet>
+                            <ContentPresenter Margin="6,0,0,0" VerticalAlignment="Center" HorizontalAlignment="Left" RecognizesAccessKey="True"/>
+                        </BulletDecorator>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="CheckMark" Property="Visibility" Value="Visible"/>
+                                <Setter TargetName="Border" Property="Background" Value="#0E639C"/>
+                                <Setter TargetName="Border" Property="BorderBrush" Value="#1177BB"/>
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Border" Property="BorderBrush" Value="#007ACC"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Foreground" Value="#6A6A6A"/>
+                                <Setter TargetName="Border" Property="Background" Value="#2D2D30"/>
+                                <Setter TargetName="Border" Property="BorderBrush" Value="#444444"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+    <StackPanel Margin="20">
+        <TextBlock Name="CredMessage" TextWrapping="Wrap" Foreground="#9CDCFE" Margin="0,0,0,12"/>
+        <TextBlock Text="Username:" Foreground="#D4D4D4" Margin="0,0,0,4"/>
+        <TextBox   Name="TxtCredUser" Margin="0,0,0,10"/>
+        <TextBlock Text="Password:" Foreground="#D4D4D4" Margin="0,0,0,4"/>
+        <PasswordBox Name="TxtCredPass" Background="#3C3C3C" Foreground="#D4D4D4"
+                     BorderBrush="#555555" Padding="5,4" Margin="0,0,0,14"/>
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button Name="BtnCredOK"     Content="OK"     IsDefault="True"/>
+            <Button Name="BtnCredCancel" Content="Cancel" IsCancel="True" Background="#4A4A4A" BorderBrush="#5A5A5A"/>
+        </StackPanel>
+    </StackPanel>
+</Window>
+"@
+
+    $credWin = New-PSMMWindow -Xaml $credXaml
+    if ($Owner) { $credWin.Owner = $Owner }
+
+    $credWin.FindName('CredMessage').Text = $Message
+    $txtUser = $credWin.FindName('TxtCredUser')
+    $txtPass = $credWin.FindName('TxtCredPass')
+    $btnOK = $credWin.FindName('BtnCredOK')
+    $btnCanc = $credWin.FindName('BtnCredCancel')
+
+    # Pre-fill with DOMAIN\username
+    $txtUser.Text = "$env:USERDOMAIN\$env:USERNAME"
+    $txtUser.SelectAll()
+
+    $credResult = $null
+
+    $btnOK.Add_Click({
+            $user = $txtUser.Text
+            $pass = $txtPass.SecurePassword
+            if ($user -and $pass.Length -gt 0) {
+                $script:_CredDialogResult = [System.Management.Automation.PSCredential]::new($user, $pass)
+                $credWin.DialogResult = $true
+                $credWin.Close()
+            }
+            else {
+                [System.Windows.MessageBox]::Show('Please enter both username and password.', 'Validation', 'OK', 'Warning')
+            }
+        }.GetNewClosure())
+
+    $btnCanc.Add_Click({
+            $script:_CredDialogResult = $null
+            $credWin.DialogResult = $false
+            $credWin.Close()
+        }.GetNewClosure())
+
+    $dialogOk = $credWin.ShowDialog()
+
+    if ($dialogOk) {
+        return $script:_CredDialogResult
+    }
+    return $null
+}
 
 function Get-PSMMCredential {
     <#
@@ -1463,11 +1535,10 @@ function Get-PSMMCredential {
     switch ($script:Settings.CredentialMode) {
         'Prompt' {
             Write-PSMMLog -Severity 'INFO' -Message 'Prompting user for credentials ...'
-            $script:Credential = Get-Credential -Message 'Enter credentials for remote operations'
+            $script:Credential = Show-PSMMCredentialDialog -Message 'Enter credentials for remote operations' -Owner $script:SyncHash.Window
         }
         'Stored' {
             Write-PSMMLog -Severity 'INFO' -Message 'Using stored credentials from Windows Credential Manager.'
-            # Placeholder -- integrate with cmdkey / CredentialManager module as needed
             $script:Credential = $null
         }
         default {
@@ -1480,11 +1551,12 @@ function Get-PSMMCredential {
 }
 #endregion Credential Management
 
+
 #region WPF XAML Definition
-# ─────────────────────────────────────────────────────────────────────────────
-# The complete WPF UI is defined as an inline XAML here-string.
+# ---------------------------------------------------------------------------
+# The complete WPF UI is defined as inline XAML here-strings.
 # No external .xaml files are needed.
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 $script:MainWindowXaml = @'
 <Window
@@ -1504,12 +1576,10 @@ $script:MainWindowXaml = @'
         <!-- Define a style for all ScrollBar controls within this scope -->
         <Style TargetType="{x:Type ScrollBar}">
             <Style.Triggers>
-                <!-- Apply properties only to the Vertical ScrollBar -->
                 <Trigger Property="Orientation" Value="Vertical">
                     <Setter Property="MinWidth" Value="5" />
                     <Setter Property="Width" Value="5" />
                 </Trigger>
-                <!-- Apply properties only to the Horizontal ScrollBar -->
                 <Trigger Property="Orientation" Value="Horizontal">
                     <Setter Property="MinHeight" Value="5" />
                     <Setter Property="Height" Value="5" />
@@ -1517,7 +1587,7 @@ $script:MainWindowXaml = @'
             </Style.Triggers>
         </Style>
 
-        <!-- ── Color Palette ───────────────────────────── -->
+        <!-- Color Palette -->
         <SolidColorBrush x:Key="PanelBg"       Color="#252526"/>
         <SolidColorBrush x:Key="BorderBrush"    Color="#3C3C3C"/>
         <SolidColorBrush x:Key="AccentBlue"     Color="#007ACC"/>
@@ -1528,7 +1598,7 @@ $script:MainWindowXaml = @'
         <SolidColorBrush x:Key="RedStatus"      Color="#F44747"/>
         <SolidColorBrush x:Key="GrayStatus"     Color="#6A6A6A"/>
 
-        <!-- ── Button Style ────────────────────────────── -->
+        <!-- Button Style -->
         <Style TargetType="Button">
             <Setter Property="Background"    Value="#0E639C"/>
             <Setter Property="Foreground"    Value="White"/>
@@ -1564,7 +1634,7 @@ $script:MainWindowXaml = @'
             </Setter>
         </Style>
 
-        <!-- ── TextBox Style ───────────────────────────── -->
+        <!-- TextBox Style -->
         <Style TargetType="TextBox">
             <Setter Property="Background"    Value="#3C3C3C"/>
             <Setter Property="Foreground"    Value="#D4D4D4"/>
@@ -1573,7 +1643,7 @@ $script:MainWindowXaml = @'
             <Setter Property="Margin"        Value="3"/>
         </Style>
 
-        <!-- ── DataGrid Style ──────────────────────────── -->
+        <!-- DataGrid Style -->
         <Style TargetType="DataGrid">
             <Setter Property="Background"           Value="#1E1E1E"/>
             <Setter Property="Foreground"            Value="#D4D4D4"/>
@@ -1593,14 +1663,14 @@ $script:MainWindowXaml = @'
             <Setter Property="FontWeight"  Value="SemiBold"/>
         </Style>
 
-        <!-- ── ListBox Style ───────────────────────────── -->
+        <!-- ListBox Style -->
         <Style TargetType="ListBox">
             <Setter Property="Background"  Value="#1E1E1E"/>
             <Setter Property="Foreground"  Value="#D4D4D4"/>
             <Setter Property="BorderBrush" Value="#3C3C3C"/>
         </Style>
 
-        <!-- ── MenuItem Style (dark menu dropdowns) ──── -->
+        <!-- MenuItem Style -->
         <Style TargetType="MenuItem">
             <Setter Property="Background"  Value="#2D2D30"/>
             <Setter Property="Foreground"  Value="#D4D4D4"/>
@@ -1616,13 +1686,13 @@ $script:MainWindowXaml = @'
             </Style.Triggers>
         </Style>
 
-        <!-- ── Separator Style (in menus) ──────────── -->
+        <!-- Separator Style -->
         <Style TargetType="Separator">
             <Setter Property="Background" Value="#3C3C3C"/>
             <Setter Property="Margin"     Value="4,2"/>
         </Style>
 
-        <!-- ── ComboBoxItem Style (dark dropdown items) ── -->
+        <!-- ComboBoxItem Style -->
         <Style TargetType="ComboBoxItem">
             <Setter Property="Background"  Value="#2D2D30"/>
             <Setter Property="Foreground"  Value="#D4D4D4"/>
@@ -1639,7 +1709,7 @@ $script:MainWindowXaml = @'
             </Style.Triggers>
         </Style>
 
-        <!-- ── ComboBox ControlTemplate (dark dropdown popup) ── -->
+        <!-- ComboBox ControlTemplate (dark dropdown popup) -->
         <ControlTemplate x:Key="ComboBoxToggleButton" TargetType="ToggleButton">
             <Grid>
                 <Grid.ColumnDefinitions>
@@ -1686,7 +1756,7 @@ $script:MainWindowXaml = @'
             </Setter>
         </Style>
 
-        <!-- Style for the Border Background -->
+        <!-- Server/VM pill toggle styles -->
         <Style x:Key="ServersPillBorderStyle" TargetType="Border">
             <Setter Property="Background" Value="#007ACC" />
             <Style.Triggers>
@@ -1696,7 +1766,6 @@ $script:MainWindowXaml = @'
             </Style.Triggers>
         </Style>
 
-        <!-- Style for the TextBlock Content -->
         <Style x:Key="ServersPillTextStyle" TargetType="TextBlock">
             <Setter Property="Text" Value="Servers Included" />
             <Style.Triggers>
@@ -1706,7 +1775,6 @@ $script:MainWindowXaml = @'
             </Style.Triggers>
         </Style>
 
-        <!-- Style for the Border Background -->
         <Style x:Key="VirtualPillBorderStyle" TargetType="Border">
             <Setter Property="Background" Value="#007ACC" />
             <Style.Triggers>
@@ -1716,7 +1784,6 @@ $script:MainWindowXaml = @'
             </Style.Triggers>
         </Style>
 
-        <!-- Style for the TextBlock Content -->
         <Style x:Key="VirtualPillTextStyle" TargetType="TextBlock">
             <Setter Property="Text" Value="VMs Included" />
             <Style.Triggers>
@@ -1726,11 +1793,48 @@ $script:MainWindowXaml = @'
             </Style.Triggers>
         </Style>
 
+        <!-- CheckBox Dark Theme -->
+        <Style TargetType="CheckBox">
+            <Setter Property="Foreground" Value="#D4D4D4"/>
+            <Setter Property="Background" Value="#3C3C3C"/>
+            <Setter Property="BorderBrush" Value="#555555"/>
+            <Setter Property="Margin" Value="0,2"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="CheckBox">
+                        <BulletDecorator Background="Transparent">
+                            <BulletDecorator.Bullet>
+                                <Grid Width="16" Height="16">
+                                    <Border x:Name="Border" Background="#3C3C3C" BorderBrush="#555555" BorderThickness="1" CornerRadius="2"/>
+                                    <Path x:Name="CheckMark" Data="M 2 6 L 6 10 L 13 2" Stroke="#4EC9B0" StrokeThickness="2" Visibility="Collapsed" Margin="1"/>
+                                </Grid>
+                            </BulletDecorator.Bullet>
+                            <ContentPresenter Margin="6,0,0,0" VerticalAlignment="Center" HorizontalAlignment="Left" RecognizesAccessKey="True"/>
+                        </BulletDecorator>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="CheckMark" Property="Visibility" Value="Visible"/>
+                                <Setter TargetName="Border" Property="Background" Value="#0E639C"/>
+                                <Setter TargetName="Border" Property="BorderBrush" Value="#1177BB"/>
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Border" Property="BorderBrush" Value="#007ACC"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Foreground" Value="#6A6A6A"/>
+                                <Setter TargetName="Border" Property="Background" Value="#2D2D30"/>
+                                <Setter TargetName="Border" Property="BorderBrush" Value="#444444"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
 
     </Window.Resources>
 
     <DockPanel>
-        <!-- ══════════════════ MENU BAR ══════════════════ -->
+        <!-- MENU BAR -->
         <Menu DockPanel.Dock="Top" Background="#333333" Foreground="#D4D4D4">
             <MenuItem Header="_File">
                 <MenuItem Header="_Settings"    Name="MenuSettings"/>
@@ -1748,99 +1852,33 @@ $script:MainWindowXaml = @'
             </MenuItem>
         </Menu>
 
-        <!-- ══════════════════ TOOLBAR ═══════════════════ -->
+        <!-- TOOLBAR -->
         <Border DockPanel.Dock="Top" Background="#252526" Padding="5,4" BorderBrush="#3C3C3C" BorderThickness="0,0,0,1">
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <StackPanel Grid.Column="0" Orientation="Horizontal">
-                    <TextBlock Text="OU Filter:" VerticalAlignment="Center" Margin="5,0"/>
-                    <TextBox Name="TxtOuFilter" Width="250" ToolTip="LDAP path or OU filter (e.g. OU=Servers,DC=corp,DC=local)"/>
-                    <TextBlock Text="Name:" VerticalAlignment="Center" Margin="10,0,5,0"/>
-                    <TextBox Name="TxtNameFilter" Width="150" Text="*" ToolTip="Computer name wildcard (e.g. WEB*)"/>
+                    <Border BorderThickness="1" BorderBrush="#3C3C3C" Background="#252526" Margin="0" Padding="0">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="Name" VerticalAlignment="Center"  Margin="10,0,10,0"/>
+                            <TextBox Name="TxtNameFilter" Width="250" Text="*" ToolTip="Computer name wildcard (e.g. WEB*)"/>
+                        </StackPanel>
+                    </Border>
                     <Button Name="BtnSearchAD" Content="&#x1F50D; Search AD" Margin="8,3"/>
                     <Separator Margin="10,2" Style="{x:Null}"/>
                     <Separator Margin="10,2" Style="{x:Null}"/>
-                    <Button Name="BtnCredentials" Content="&#x1F511; Credentials" Background="#4A4A4A" BorderBrush="#5A5A5A"/>
+                    
                 </StackPanel>
 
-                <StackPanel Grid.Column="2" Orientation="Horizontal" Margin="20,0,5,0" >
-                    <!-- Skip Servers CheckBox (hidden, drives pill state) -->
-                    <CheckBox Name="ChkSkipServers" Visibility="Collapsed" />
-
-                    <!-- Skip Servers Pill -->
-                    <Border Margin="20,0,5,0" Height="30" CornerRadius="15" Padding="12,0" Cursor="Hand"
-                            ToolTip="Include/Exclude computers with a Server OS in settings">
-                        <Border.Style>
-                            <Style TargetType="Border">
-                                <Setter Property="Background" Value="#007ACC" />
-                                <Style.Triggers>
-                                    <DataTrigger Binding="{Binding ElementName=ChkSkipServers, Path=IsChecked}" Value="True">
-                                        <Setter Property="Background" Value="#444444" />
-                                    </DataTrigger>
-                                </Style.Triggers>
-                            </Style>
-                        </Border.Style>
-
-        
-                        <!-- Label text -->
-                        <TextBlock VerticalAlignment="Center" Foreground="White" FontSize="12">
-                            <TextBlock.Style>
-                                <Style TargetType="TextBlock">
-                                    <Setter Property="Text" Value="&#x2714; Servers" />
-                                    <Style.Triggers>
-                                        <DataTrigger Binding="{Binding ElementName=ChkSkipServers, Path=IsChecked}" Value="True">
-                                            <Setter Property="Text" Value="&#x2718; Servers" />
-                                        </DataTrigger>
-                                    </Style.Triggers>
-                                </Style>
-                            </TextBlock.Style>
-                        </TextBlock>
-                
-                    </Border>
-                </StackPanel>
-
-                <StackPanel Grid.Column="3" Orientation="Horizontal" Margin="0,0">
-                    <!-- Skip Virtual CheckBox (hidden, drives pill state) -->
-                    <CheckBox Name="ChkSkipVirtual" Visibility="Collapsed" />
-
-                    <!-- Skip Virtual Pill -->
-                    <Border Margin="20,0,5,0" Height="30" CornerRadius="15" Padding="12,0" Cursor="Hand" ToolTip="Include/Exclude virtual machines in settings">
-                        <Border.Style>
-                            <Style TargetType="Border">
-                                <Setter Property="Background" Value="#007ACC" />
-                                <Style.Triggers>
-                                    <DataTrigger Binding="{Binding ElementName=ChkSkipVirtual, Path=IsChecked}" Value="True">
-                                        <Setter Property="Background" Value="#444444" />
-                                    </DataTrigger>
-                                </Style.Triggers>
-                            </Style>
-                        </Border.Style>
-             
-                        <!-- Label text -->
-                        <TextBlock VerticalAlignment="Center" Foreground="White" FontSize="12">
-                            <TextBlock.Style>
-                                <Style TargetType="TextBlock">
-                                    <Setter Property="Text" Value="&#x2714; VMs" />
-                                    <Style.Triggers>
-                                        <DataTrigger Binding="{Binding ElementName=ChkSkipVirtual, Path=IsChecked}" Value="True">
-                                            <Setter Property="Text" Value="&#x2718; VMs" />
-                                        </DataTrigger>
-                                    </Style.Triggers>
-                                </Style>
-                            </TextBlock.Style>
-                        </TextBlock>
-                    </Border>
-                </StackPanel>
+                <Button Grid.Column="2" Name="BtnCredentials" Content="&#x1F511; Credentials" Background="#4A4A4A" BorderBrush="#5A5A5A"/>
 
             </Grid>
         </Border>
 
-        <!-- ══════════════════ STATUS BAR ════════════════ -->
+        <!-- STATUS BAR -->
         <Border DockPanel.Dock="Bottom" Background="#007ACC" Padding="8,3">
             <DockPanel>
                 <TextBlock Name="StatusText" Text="Ready" Foreground="White" VerticalAlignment="Center"/>
@@ -1851,7 +1889,7 @@ $script:MainWindowXaml = @'
             </DockPanel>
         </Border>
 
-        <!-- ══════════════════ MAIN CONTENT ══════════════ -->
+        <!-- MAIN CONTENT -->
         <Grid>
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="240" MinWidth="180"/>
@@ -1866,7 +1904,7 @@ $script:MainWindowXaml = @'
                 <RowDefinition Height="180" MinHeight="100"/>
             </Grid.RowDefinitions>
 
-            <!-- ── LEFT: Computer List ───────────────────── -->
+            <!-- LEFT: Computer List -->
             <Border Grid.Column="0" Grid.Row="0" Grid.RowSpan="3"
                     Background="{StaticResource PanelBg}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,1,0">
                 <DockPanel>
@@ -1902,13 +1940,13 @@ $script:MainWindowXaml = @'
             <!-- Splitter -->
             <GridSplitter Grid.Column="1" Grid.Row="0" Grid.RowSpan="3" Width="4" Background="#3C3C3C" HorizontalAlignment="Center" VerticalAlignment="Stretch"/>
 
-            <!-- ── CENTER: Module Data Grid ──────────────── -->
+            <!-- CENTER: Module Data Grid -->
             <DockPanel Grid.Column="2" Grid.Row="0" Margin="5,5,5,0">
                 <DockPanel DockPanel.Dock="Top">
                     <TextBlock Text="Module Inventory" FontWeight="Bold" FontSize="14" Margin="5,5" Foreground="{StaticResource AccentBlue}"/>
                     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-                        <Button Name="BtnExportCsv" Content="Export CSV" Background="#4A4A4A" BorderBrush="#5A5A5A" Margin="5,3" Padding="10,4" FontSize="11"/>
-                        <Button Name="BtnClearGrid" Content="Clear" Background="#4A4A4A" BorderBrush="#5A5A5A" Margin="5,3" Padding="10,4" FontSize="11"/>
+                        <Button Name="BtnExportCsv" Content="🧾 Export CSV" BorderBrush="#0E639C" Margin="5,3" Padding="10,4" FontSize="11"/>
+                        <Button Name="BtnClearGrid" Content="❌ Clear" Background="#4A4A4A" BorderBrush="#5A5A5A" Margin="5,3" Padding="10,4" FontSize="11"/>
                     </StackPanel>
                 </DockPanel>
                 <DataGrid Name="ModuleDataGrid"
@@ -1930,17 +1968,17 @@ $script:MainWindowXaml = @'
                 </DataGrid>
             </DockPanel>
 
-            <!-- ── Log pane splitter ─────────────────────── -->
+            <!-- Log pane splitter -->
             <GridSplitter Grid.Column="2" Grid.Row="1" Height="4" Background="#3C3C3C" HorizontalAlignment="Stretch" VerticalAlignment="Center"/>
 
-            <!-- ── BOTTOM CENTER: Log Pane ───────────────── -->
+            <!-- BOTTOM CENTER: Log Pane -->
             <Border Grid.Column="2" Grid.Row="2" Background="{StaticResource PanelBg}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0">
                 <DockPanel>
                     <DockPanel DockPanel.Dock="Top">
                         <TextBlock Text="Log" FontWeight="Bold" FontSize="13" Margin="8,5" Foreground="{StaticResource AccentBlue}"/>
                         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-                            <Button Name="BtnExportLog" Content="Export" Background="#4A4A4A" BorderBrush="#5A5A5A" Margin="5,3" Padding="10,4" FontSize="11"/>
-                            <Button Name="BtnClearLog" Content="Clear" Background="#4A4A4A" BorderBrush="#5A5A5A" Margin="5,3" Padding="10,4" FontSize="11"/>
+                            <Button Name="BtnExportLog" Content="🧾 Export" BorderBrush="#0E639C" Margin="5,3" Padding="10,4" FontSize="11"/>
+                            <Button Name="BtnClearLog" Content="❌ Clear" Background="#4A4A4A" BorderBrush="#5a5a5a" Margin="5,3" Padding="10,4" FontSize="11"/>
                         </StackPanel>
                     </DockPanel>
                     <ListBox Name="LogListBox" Margin="5,0,5,5" FontFamily="Consolas" FontSize="11.5" Background="#1E1E1E" BorderThickness="0"/>
@@ -1950,7 +1988,7 @@ $script:MainWindowXaml = @'
             <!-- Splitter -->
             <GridSplitter Grid.Column="3" Grid.Row="0" Grid.RowSpan="3" Width="4" Background="#3C3C3C" HorizontalAlignment="Center" VerticalAlignment="Stretch"/>
 
-            <!-- ── RIGHT: Actions Panel ──────────────────── -->
+            <!-- RIGHT: Actions Panel -->
             <Border Grid.Column="4" Grid.Row="0" Grid.RowSpan="3" Background="{StaticResource PanelBg}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1,0,0,0">
                 <StackPanel Margin="8">
                     <TextBlock Text="Actions" FontWeight="Bold" FontSize="14" Margin="0,5,0,10" Foreground="{StaticResource AccentBlue}"/>
@@ -1970,6 +2008,12 @@ $script:MainWindowXaml = @'
 
                     <Separator Margin="0,12" Background="#3C3C3C"/>
 
+                    <CheckBox Name="ChkSkipServers" Content="Skip Servers" Margin="0,6,0,8"/>
+
+                    <CheckBox Name="ChkSkipVirtual"  Content="Skip Virtual Machines" Margin="0,3,0,8"/>
+
+                    <Separator Margin="0,12" Background="#3C3C3C"/>
+
                     <Button Name="BtnCancelJobs" Content="&#x23F9; Cancel Jobs" Background="#6A3030" BorderBrush="#8A4040"/>
                     <Button Name="BtnSettings"   Content="&#x2699; Settings"    Background="#4A4A4A" BorderBrush="#5A5A5A" Margin="3,10,3,3"/>
                 </StackPanel>
@@ -1979,15 +2023,14 @@ $script:MainWindowXaml = @'
 </Window>
 '@
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Settings Dialog XAML (also inline)
-# ──────────────────────────────────────────────────────────────────────────────
+# Settings Dialog XAML
 $script:SettingsDialogXaml = @'
 <Window
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     Title="Settings -- PS-ModuleManager"
-    Width="600" Height="700"
+    Width="700" Height="760"
+    MinWidth="700" MinHeight="760"
     WindowStartupLocation="CenterOwner"
     ResizeMode="NoResize"
     Background="#1E1E1E"
@@ -1996,16 +2039,12 @@ $script:SettingsDialogXaml = @'
     FontSize="13">
 
     <Window.Resources>
-
-        <!-- Define a style for all ScrollBar controls within this scope -->
         <Style TargetType="{x:Type ScrollBar}">
             <Style.Triggers>
-                <!-- Apply properties only to the Vertical ScrollBar -->
                 <Trigger Property="Orientation" Value="Vertical">
                     <Setter Property="MinWidth" Value="5" />
                     <Setter Property="Width" Value="5" />
                 </Trigger>
-                <!-- Apply properties only to the Horizontal ScrollBar -->
                 <Trigger Property="Orientation" Value="Horizontal">
                     <Setter Property="MinHeight" Value="5" />
                     <Setter Property="Height" Value="5" />
@@ -2045,7 +2084,6 @@ $script:SettingsDialogXaml = @'
             </Setter>
         </Style>
 
-        <!-- ── ComboBoxItem Style (dark dropdown items) ── -->
         <Style TargetType="ComboBoxItem">
             <Setter Property="Background"  Value="#2D2D30"/>
             <Setter Property="Foreground"  Value="#D4D4D4"/>
@@ -2062,7 +2100,6 @@ $script:SettingsDialogXaml = @'
             </Style.Triggers>
         </Style>
 
-        <!-- ── ComboBox ControlTemplate (dark dropdown popup) ── -->
         <ControlTemplate x:Key="SettComboBoxToggleButton" TargetType="ToggleButton">
             <Grid>
                 <Grid.ColumnDefinitions>
@@ -2108,16 +2145,54 @@ $script:SettingsDialogXaml = @'
                 </Setter.Value>
             </Setter>
         </Style>
+
+        <!-- CheckBox Dark Theme -->
+        <Style TargetType="CheckBox">
+            <Setter Property="Foreground" Value="#D4D4D4"/>
+            <Setter Property="Background" Value="#3C3C3C"/>
+            <Setter Property="BorderBrush" Value="#555555"/>
+            <Setter Property="Margin" Value="0,2"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="CheckBox">
+                        <BulletDecorator Background="Transparent">
+                            <BulletDecorator.Bullet>
+                                <Grid Width="16" Height="16">
+                                    <Border x:Name="Border" Background="#3C3C3C" BorderBrush="#555555" BorderThickness="1" CornerRadius="2"/>
+                                    <Path x:Name="CheckMark" Data="M 2 6 L 6 10 L 13 2" Stroke="#4EC9B0" StrokeThickness="2" Visibility="Collapsed" Margin="1"/>
+                                </Grid>
+                            </BulletDecorator.Bullet>
+                            <ContentPresenter Margin="6,0,0,0" VerticalAlignment="Center" HorizontalAlignment="Left" RecognizesAccessKey="True"/>
+                        </BulletDecorator>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="CheckMark" Property="Visibility" Value="Visible"/>
+                                <Setter TargetName="Border" Property="Background" Value="#0E639C"/>
+                                <Setter TargetName="Border" Property="BorderBrush" Value="#1177BB"/>
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Border" Property="BorderBrush" Value="#007ACC"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Foreground" Value="#6A6A6A"/>
+                                <Setter TargetName="Border" Property="Background" Value="#2D2D30"/>
+                                <Setter TargetName="Border" Property="BorderBrush" Value="#444444"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
     </Window.Resources>
 
-    <Grid Margin="20">
+    <Grid >
         <Grid.RowDefinitions>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
         <ScrollViewer VerticalScrollBarVisibility="Auto">
-            <StackPanel>
+            <StackPanel Margin="20,20,20,0">
                 <TextBlock Text="Domain LDAP Path" FontWeight="SemiBold" Foreground="#9CDCFE"/>
                 <TextBox Name="TxtSettLdap" ToolTip="e.g. LDAP://DC=corp,DC=local"/>
 
@@ -2166,26 +2241,22 @@ $script:SettingsDialogXaml = @'
                     <ComboBoxItem Content="ERROR"/>
                 </ComboBox>
 
-                <CheckBox Name="ChkReachability" Content="Test WinRM reachability before operations"
-                          Foreground="#D4D4D4" IsChecked="True" Margin="0,8"/>
-                <CheckBox Name="ChkExcludeServers" Content="Exclude Server OS computers by default"
-                          Foreground="#D4D4D4" Margin="0,4"/>
-                <CheckBox Name="ChkExcludeVirtual" Content="Exclude virtual machines by default"
-                          Foreground="#D4D4D4" Margin="0,4"/>
+                <CheckBox Name="ChkReachability" Content="Test WinRM reachability before operations" Foreground="#D4D4D4" IsChecked="True" Margin="0,4"/>
+                <CheckBox Name="ChkExcludeServers" Content="Exclude Server OS computers by default" Foreground="#D4D4D4" Margin="0,4"/>
+                <CheckBox Name="ChkExcludeVirtual" Content="Exclude virtual machines by default" Foreground="#D4D4D4" Margin="0,4"/>
 
                 <TextBlock Text="OS Filter (wildcards supported, e.g. '*Windows 10*'):" Foreground="#CCCCCC" Margin="0,12,0,2"/>
-                <TextBox Name="TxtOsFilter" Background="#3C3C3C" Foreground="#D4D4D4"
-                         BorderBrush="#5A5A5A" Padding="4" ToolTip="Filter computers by OS (e.g. '*Windows 10*' or '*Server 2019*'). Leave empty for no filter."/>
+                <TextBox Name="TxtOsFilter" Background="#3C3C3C" Foreground="#D4D4D4" BorderBrush="#5A5A5A" Padding="4" ToolTip="Filter computers by OS. Leave empty for no filter."/>
             </StackPanel>
         </ScrollViewer>
 
-        <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
-            <Button Name="BtnSettImport" Content="Import"      Background="#4A4A4A" BorderBrush="#5A5A5A"/>
-            <Button Name="BtnSettExport" Content="Export"      Background="#4A4A4A" BorderBrush="#5A5A5A"/>
+        <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="20,10">
+            <Button Name="BtnSettImport" Content="➕ Import"      Background="#4A4A4A" BorderBrush="#5A5A5A"/>
+            <Button Name="BtnSettExport" Content="⬆️ Export"      Background="#4A4A4A" BorderBrush="#5A5A5A"/>
             <Button Name="BtnTestShare"  Content="Test Share"  Background="#4A4A4A" BorderBrush="#5A5A5A"/>
             <Button Name="BtnTestAD"     Content="Test AD"     Background="#4A4A4A" BorderBrush="#5A5A5A"/>
-            <Button Name="BtnSettSave"   Content="Save"/>
-            <Button Name="BtnSettCancel" Content="Cancel"      Background="#4A4A4A" BorderBrush="#5A5A5A"/>
+            <Button Name="BtnSettSave"   Content="💾 Save"/>
+            <Button Name="BtnSettCancel" Content="❌Cancel"      Background="#6A3030" BorderBrush="#6A3030"/>
         </StackPanel>
     </Grid>
 </Window>
@@ -2193,10 +2264,155 @@ $script:SettingsDialogXaml = @'
 
 #endregion WPF XAML Definition
 
+
+#region SyncHash Helpers
+# ---------------------------------------------------------------------------
+# Functions to initialize the synchronized hashtable with all named WPF
+# controls, and to perform thread-safe UI updates via Dispatcher.Invoke().
+#
+# This is THE core of the new architecture:
+#   1. $syncHash.Window holds the WPF Window reference
+#   2. $syncHash.<ControlName> holds every named control
+#   3. Background runspaces receive $syncHash and update UI via:
+#        $syncHash.Window.Dispatcher.Invoke([Action]{ ... })
+# ---------------------------------------------------------------------------
+
+function Initialize-PSMMSyncHash {
+    <#
+    .SYNOPSIS
+        Populates $script:SyncHash with the Window and all named controls.
+    .DESCRIPTION
+        After parsing XAML, this function walks the visual tree and stores every
+        named WPF control in $script:SyncHash so background runspaces can
+        reference them via Dispatcher.Invoke().
+    .PARAMETER Window
+        The parsed WPF Window object.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Windows.Window]$Window
+    )
+
+    $script:SyncHash.Window = $Window
+
+    # Store all named controls in the syncHash
+    $controlNames = @(
+        # Toolbar
+        'TxtOuFilter', 'TxtNameFilter', 'BtnSearchAD', 'BtnCredentials',
+        'ChkSkipServers', 'ChkSkipVirtual',
+        # Menu items
+        'MenuSettings', 'MenuExit', 'MenuRefreshAD', 'MenuTestConn', 'MenuCancelJobs', 'MenuAbout',
+        # Computer list
+        'ComputerListBox', 'TxtComputerCount',
+        'BtnSelectAll', 'BtnDeselectAll', 'BtnInvertSelect',
+        # Module grid
+        'ModuleDataGrid', 'BtnExportCsv', 'BtnClearGrid',
+        # Log pane
+        'LogListBox', 'BtnExportLog', 'BtnClearLog',
+        # Actions panel
+        'BtnInventory', 'BtnInstall', 'BtnUpdate', 'BtnRemove',
+        'CmbModule', 'CmbVersion',
+        'BtnCancelJobs', 'BtnSettings',
+        # Status bar
+        'StatusText', 'StatusProgress', 'StatusJobs'
+    )
+
+    foreach ($name in $controlNames) {
+        $control = $Window.FindName($name)
+        if ($control) {
+            $script:SyncHash[$name] = $control
+        }
+    }
+
+    # Store the ObservableCollections so background runspaces can reference them
+    $script:SyncHash.ComputerList = $script:ComputerList
+    $script:SyncHash.ModuleGrid = $script:ModuleGrid
+
+    Write-PSMMLog -Severity 'DEBUG' -Message "SyncHash initialized with $($controlNames.Count) control references."
+}
+
+function Invoke-PSMMDispatcherUpdate {
+    <#
+    .SYNOPSIS
+        Invokes an action on the WPF UI thread via the syncHash Dispatcher.
+    .DESCRIPTION
+        Thread-safe way to update any WPF control from a background runspace.
+        The $syncHash.Window.Dispatcher.Invoke() pattern ensures all UI mutations
+        happen on the STA thread that owns the WPF objects.
+    .PARAMETER Action
+        The script block to run on the UI thread.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [scriptblock]$Action
+    )
+
+    if ($script:SyncHash.Window -and $script:SyncHash.Window.Dispatcher) {
+        $script:SyncHash.Window.Dispatcher.Invoke(
+            $Action,
+            [System.Windows.Threading.DispatcherPriority]::Background
+        )
+    }
+}
+
+function Invoke-PSMMBackgroundRunspace {
+    <#
+    .SYNOPSIS
+        Spawns a new background runspace that has access to the syncHash.
+    .DESCRIPTION
+        Creates a new runspace, injects the $syncHash variable, runs the
+        given script block asynchronously, and returns the runspace/handle
+        for optional tracking.  The script block should update the UI
+        exclusively via $syncHash.Window.Dispatcher.Invoke([Action]{...}).
+    .PARAMETER ScriptBlock
+        The code to execute in the background. It receives $syncHash as
+        a variable in scope.
+    .PARAMETER ArgumentList
+        Additional variables to inject into the runspace as named variables.
+        Pass as a hashtable of @{ VarName = Value }.
+    .OUTPUTS
+        [PSCustomObject] with Runspace, PowerShell, and Handle properties.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [scriptblock]$ScriptBlock,
+
+        [hashtable]$ArgumentList = @{}
+    )
+
+    $rs = [RunspaceFactory]::CreateRunspace()
+    $rs.ApartmentState = [System.Threading.ApartmentState]::STA
+    $rs.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+    $rs.Open()
+
+    # Inject syncHash into the new runspace
+    $rs.SessionStateProxy.SetVariable('syncHash', $script:SyncHash)
+
+    # Inject any additional variables
+    foreach ($key in $ArgumentList.Keys) {
+        $rs.SessionStateProxy.SetVariable($key, $ArgumentList[$key])
+    }
+
+    $ps = [PowerShell]::Create().AddScript($ScriptBlock)
+    $ps.Runspace = $rs
+    $handle = $ps.BeginInvoke()
+
+    return [PSCustomObject]@{
+        Runspace   = $rs
+        PowerShell = $ps
+        Handle     = $handle
+    }
+}
+#endregion SyncHash Helpers
+
+
 #region WPF Helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Utility functions for creating and interacting with WPF windows.
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 function New-PSMMWindow {
     <#
@@ -2213,9 +2429,7 @@ function New-PSMMWindow {
         [string]$Xaml
     )
 
-    # Remove x:Class if present (not needed outside Visual Studio)
     $cleanXaml = $Xaml -replace 'x:Class="[^"]*"', ''
-
     $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($cleanXaml))
     $window = [System.Windows.Markup.XamlReader]::Load($reader)
 
@@ -2241,38 +2455,10 @@ function Find-PSMMControl {
     return $Window.FindName($Name)
 }
 
-function Update-PSMMDispatcher {
-    <#
-    .SYNOPSIS
-        Invokes an action on the WPF dispatcher thread (thread-safe UI update).
-    .PARAMETER Action
-        The script block to run on the UI thread.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [scriptblock]$Action
-    )
-
-    if ($script:MainWindow -and $script:MainWindow.Dispatcher) {
-        $script:MainWindow.Dispatcher.Invoke($Action, [System.Windows.Threading.DispatcherPriority]::Background)
-    }
-}
-#endregion WPF Helpers
-
-#region WPF Event Handlers
-# ─────────────────────────────────────────────────────────────────────────────
-# Event handler functions wired to WPF controls.
-# All handlers are wrapped in try/catch to prevent silent crashes.
-# ─────────────────────────────────────────────────────────────────────────────
-
 function Invoke-PSMMSafeAction {
     <#
     .SYNOPSIS
         Wraps a script block in try/catch for safe UI event handling.
-    .DESCRIPTION
-        Executes the given action and catches any unhandled exception, showing
-        it in a WPF MessageBox and logging it. Prevents UI freezes.
     .PARAMETER Action
         The script block to execute safely.
     .PARAMETER Context
@@ -2297,11 +2483,24 @@ function Invoke-PSMMSafeAction {
             'Error', 'OK', 'Error') | Out-Null
     }
 }
+#endregion WPF Helpers
+
+
+#region WPF Event Handlers
+# ---------------------------------------------------------------------------
+# Event handler functions wired to WPF controls.
+# All handlers use the $syncHash pattern for thread-safe UI updates.
+# Background operations spawn child runspaces with $syncHash access.
+# ---------------------------------------------------------------------------
 
 function Register-PSMMMainWindowEvents {
     <#
     .SYNOPSIS
         Wires up all event handlers for the main window controls.
+    .DESCRIPTION
+        Each handler that runs a long operation spawns a background runspace
+        (via Invoke-PSMMBackgroundRunspace) that receives the $syncHash for
+        thread-safe Dispatcher.Invoke() UI updates.
     .PARAMETER Window
         The main WPF Window object.
     #>
@@ -2310,224 +2509,253 @@ function Register-PSMMMainWindowEvents {
         [System.Windows.Window]$Window
     )
 
-    # ── Search AD ────────────────────────────────────────────────────────────
-    $btnSearch = Find-PSMMControl -Window $Window -Name 'BtnSearchAD'
-    $btnSearch.Add_Click({
-            $ouFilter = (Find-PSMMControl -Window $script:MainWindow -Name 'TxtOuFilter').Text
-            $nameFilter = (Find-PSMMControl -Window $script:MainWindow -Name 'TxtNameFilter').Text
-            if (-not $nameFilter) { $nameFilter = '*' }
+    $sh = $script:SyncHash
 
-            $ldapPath = if ($ouFilter) { "LDAP://$ouFilter" } else { $script:Settings.DomainLdapPath }
+    # -- Seed main-window checkboxes from current settings ----------------------
+    $sh.ChkSkipServers.IsChecked = [bool]$script:Settings.ExcludeServers
+    $sh.ChkSkipVirtual.IsChecked = [bool]$script:Settings.ExcludeVirtual
 
-            Write-PSMMLog -Severity 'INFO' -Message "Searching AD: OU=$ouFilter, Name=$nameFilter"
+    # Two-way sync: main-window checkbox -> $script:Settings (and persist)
+    $chkSkipServersHandler = {
+        $script:Settings['ExcludeServers'] = ($script:SyncHash.ChkSkipServers.IsChecked -eq $true)
+        Export-PSMMSettings -Settings $script:Settings
+    }
+    $chkSkipVirtualHandler = {
+        $script:Settings['ExcludeVirtual'] = ($script:SyncHash.ChkSkipVirtual.IsChecked -eq $true)
+        Export-PSMMSettings -Settings $script:Settings
+    }
+    $sh.ChkSkipServers.Add_Checked($chkSkipServersHandler)
+    $sh.ChkSkipServers.Add_Unchecked($chkSkipServersHandler)
+    $sh.ChkSkipVirtual.Add_Checked($chkSkipVirtualHandler)
+    $sh.ChkSkipVirtual.Add_Unchecked($chkSkipVirtualHandler)
 
-            try {
-                $skipServers = (Find-PSMMControl -Window $script:MainWindow -Name 'ChkSkipServers').IsChecked -eq $true
-                $skipVirtual = (Find-PSMMControl -Window $script:MainWindow -Name 'ChkSkipVirtual').IsChecked -eq $true
-                $computers = Get-PSMMComputers -LdapPath $ldapPath -NameFilter $nameFilter -ExcludeServers $skipServers -ExcludeVirtual $skipVirtual
+    # -- Search AD (spawns background runspace) --------------------------------
+    $sh.BtnSearchAD.Add_Click({
+            Invoke-PSMMSafeAction -Context 'AD Search' -Action {
+                $ouFilter = $script:SyncHash.TxtOuFilter.Text
+                $nameFilter = $script:SyncHash.TxtNameFilter.Text
+                if (-not $nameFilter) { $nameFilter = '*' }
 
-                # Determine local computer name for status detection
-                $localName = $env:COMPUTERNAME
+                $ldapPath = if ($ouFilter) { "LDAP://$ouFilter" } else { $script:Settings.DomainLdapPath }
 
-                $script:ComputerList.Clear()
-                foreach ($c in $computers) {
-                    # Determine connection status
-                    $connStatus = if ($c.Name -eq $localName -or $c.Name -eq 'localhost') {
-                        'Local'
-                    } elseif ($c.Reachable -eq $true) {
-                        'WinRM'
-                    } elseif ($c.Reachable -eq $false) {
-                        'Unreachable'
-                    } else {
-                        'Unknown'
+                # Update status immediately via Dispatcher
+                Invoke-PSMMDispatcherUpdate -Action {
+                    $script:SyncHash.StatusText.Text = 'Searching Active Directory ...'
+                    $script:SyncHash.StatusProgress.IsIndeterminate = $true
+                    $script:SyncHash.StatusProgress.Visibility = [System.Windows.Visibility]::Visible
+                }
+
+                Write-PSMMLog -Severity 'INFO' -Message "Searching AD: OU=$ouFilter, Name=$nameFilter"
+
+                try {
+                    $skipServers = $script:SyncHash.ChkSkipServers.IsChecked -eq $true
+                    $skipVirtual = $script:SyncHash.ChkSkipVirtual.IsChecked -eq $true
+                    $computers = Get-PSMMComputers -LdapPath $ldapPath -NameFilter $nameFilter -ExcludeServers $skipServers -ExcludeVirtual $skipVirtual
+
+                    $localName = $env:COMPUTERNAME
+
+                    # Update the ObservableCollection on the UI thread
+                    $script:ComputerList.Clear()
+                    foreach ($c in $computers) {
+                        $connStatus = if ($c.Name -eq $localName -or $c.Name -eq 'localhost') {
+                            'Local'
+                        }
+                        elseif ($c.Reachable -eq $true) {
+                            'WinRM'
+                        }
+                        elseif ($c.Reachable -eq $false) {
+                            'Unreachable'
+                        }
+                        else {
+                            'Unknown'
+                        }
+
+                        $autoSelect = $connStatus -in @('Local', 'WinRM')
+
+                        $script:ComputerList.Add([ComputerItem]@{
+                                IsSelected       = $autoSelect
+                                Name             = $c.Name
+                                ConnectionStatus = $connStatus
+                            })
                     }
 
-                    # Auto-select if Local or WinRM reachable
-                    $autoSelect = $connStatus -in @('Local', 'WinRM')
+                    # Update count text
+                    $script:SyncHash.TxtComputerCount.Text = "$($computers.Count) computers"
 
-                    $script:ComputerList.Add([ComputerItem]@{
-                        IsSelected       = $autoSelect
-                        Name             = $c.Name
-                        ConnectionStatus = $connStatus
-                    })
+                    # Hide progress
+                    Invoke-PSMMDispatcherUpdate -Action {
+                        $script:SyncHash.StatusProgress.IsIndeterminate = $false
+                        $script:SyncHash.StatusProgress.Visibility = [System.Windows.Visibility]::Collapsed
+                        $script:SyncHash.StatusText.Text = "Found $($script:ComputerList.Count) computer(s)"
+                    }
+                }
+                catch {
+                    Write-PSMMLog -Severity 'ERROR' -Message "AD search failed: $_"
+                    Invoke-PSMMDispatcherUpdate -Action {
+                        $script:SyncHash.StatusProgress.IsIndeterminate = $false
+                        $script:SyncHash.StatusProgress.Visibility = [System.Windows.Visibility]::Collapsed
+                        $script:SyncHash.StatusText.Text = 'AD search failed'
+                    }
+                    [System.Windows.MessageBox]::Show("AD search failed:`n$_", 'Error', 'OK', 'Error')
+                }
+            }
+        })
+
+    # -- Inventory (uses runspace pool + job poller) ----------------------------
+    $sh.BtnInventory.Add_Click({
+            Invoke-PSMMSafeAction -Context 'Inventory' -Action {
+                $selected = @($script:ComputerList | Where-Object { $_.IsSelected } | ForEach-Object { $_.Name })
+
+                if ($selected.Count -eq 0) {
+                    [System.Windows.MessageBox]::Show('Check one or more computers first.', 'Info', 'OK', 'Information')
+                    return
                 }
 
-                $countText = Find-PSMMControl -Window $script:MainWindow -Name 'TxtComputerCount'
-                $countText.Text = "$($computers.Count) computers"
-            }
-            catch {
-                Write-PSMMLog -Severity 'ERROR' -Message "AD search failed: $_"
-                [System.Windows.MessageBox]::Show("AD search failed:`n$_", 'Error', 'OK', 'Error')
-            }
-        })
+                $cmbMod = $script:SyncHash.CmbModule
+                $modFilter = if ($cmbMod.SelectedItem) { $cmbMod.SelectedItem.ToString() } else { $null }
 
-    # ── Inventory ────────────────────────────────────────────────────────────
-    $btnInventory = Find-PSMMControl -Window $Window -Name 'BtnInventory'
-    $btnInventory.Add_Click({
-        Invoke-PSMMSafeAction -Context 'Inventory' -Action {
-            # Get computers checked via checkbox
-            $selected = @($script:ComputerList | Where-Object { $_.IsSelected } | ForEach-Object { $_.Name })
-
-            if ($selected.Count -eq 0) {
-                [System.Windows.MessageBox]::Show('Check one or more computers first.', 'Info', 'OK', 'Information')
-                return
-            }
-
-            # Check if a specific module is selected in the Module combobox
-            $cmbMod = Find-PSMMControl -Window $script:MainWindow -Name 'CmbModule'
-            $modFilter = if ($cmbMod.SelectedItem) { $cmbMod.SelectedItem.ToString() } else { $null }
-
-            if ($modFilter) {
-                Write-PSMMLog -Severity 'INFO' -Message "Starting inventory for '$modFilter' on $($selected.Count) computer(s) ..."
-            } else {
-                Write-PSMMLog -Severity 'INFO' -Message "Starting inventory (all modules) on $($selected.Count) computer(s) ..."
-            }
-
-            # Clear previous inventory rows for the selected computers to avoid duplicates
-            $toRemove = @($script:ModuleGrid | Where-Object { $selected -contains $_.ComputerName })
-            foreach ($item in $toRemove) { $script:ModuleGrid.Remove($item) }
-
-            # Launch async inventory -- filtered to the selected module if one is chosen
-            $null = Get-PSMMRemoteModules -ComputerNames $selected -ModuleName $modFilter
-
-            # Start a dispatcher timer to poll results
-            Start-PSMMJobPoller -Operation 'Inventory'
-        }
-        })
-
-    # ── Install ──────────────────────────────────────────────────────────────
-    $btnInstall = Find-PSMMControl -Window $Window -Name 'BtnInstall'
-    $btnInstall.Add_Click({
-        Invoke-PSMMSafeAction -Context 'Install' -Action {
-            $cmbMod = Find-PSMMControl -Window $script:MainWindow -Name 'CmbModule'
-            $cmbVer = Find-PSMMControl -Window $script:MainWindow -Name 'CmbVersion'
-
-            # Get computers checked via checkbox
-            $selected = @($script:ComputerList | Where-Object { $_.IsSelected } | ForEach-Object { $_.Name })
-
-            if ($selected.Count -eq 0 -or -not $cmbMod.SelectedItem) {
-                [System.Windows.MessageBox]::Show('Check computer(s) and select a module.', 'Info', 'OK', 'Information')
-                return
-            }
-
-            $modName = $cmbMod.SelectedItem.ToString()
-            $version = if ($cmbVer.SelectedItem) { $cmbVer.SelectedItem.ToString() } else { $null }
-
-            # Build detailed confirmation with computer list
-            $compList = ($selected | Select-Object -First 10) -join ", "
-            if ($selected.Count -gt 10) { $compList += " ... and $($selected.Count - 10) more" }
-            $confirm = [System.Windows.MessageBox]::Show(
-                "Install $modName $(if ($version) {"v$version "})on $($selected.Count) computer(s)?`n`nComputers: $compList",
-                'Confirm Install', 'YesNo', 'Question')
-
-            if ($confirm -eq 'Yes') {
-                $null = Install-PSMMModule -ComputerNames $selected -ModuleName $modName -Version $version
-                Start-PSMMJobPoller -Operation 'Install'
-            }
-        }
-        })
-
-    # ── Update ───────────────────────────────────────────────────────────────
-    $btnUpdate = Find-PSMMControl -Window $Window -Name 'BtnUpdate'
-    $btnUpdate.Add_Click({
-        Invoke-PSMMSafeAction -Context 'Update' -Action {
-            $grid = Find-PSMMControl -Window $script:MainWindow -Name 'ModuleDataGrid'
-            $outdated = @()
-            foreach ($item in $grid.SelectedItems) {
-                if ($item.Status -eq 'Outdated') { $outdated += $item }
-            }
-
-            if ($outdated.Count -eq 0) {
-                [System.Windows.MessageBox]::Show('Select outdated module rows in the grid.', 'Info', 'OK', 'Information')
-                return
-            }
-
-            # Build detailed confirmation with module/computer list
-            $detailLines = @()
-            foreach ($item in $outdated) {
-                $detailLines += "  $($item.ComputerName): $($item.ModuleName) $($item.InstalledVersion) -> $($item.TargetVersion)"
-            }
-            $detailText = ($detailLines | Select-Object -First 15) -join "`n"
-            if ($detailLines.Count -gt 15) { $detailText += "`n  ... and $($detailLines.Count - 15) more" }
-
-            $confirm = [System.Windows.MessageBox]::Show(
-                "Update $($outdated.Count) module(s)?`n`n$detailText",
-                'Confirm Update', 'YesNo', 'Question')
-
-            if ($confirm -eq 'Yes') {
-                foreach ($item in $outdated) {
-                    $null = Install-PSMMModule -ComputerNames @($item.ComputerName) -ModuleName $item.ModuleName -Version $item.TargetVersion
+                if ($modFilter) {
+                    Write-PSMMLog -Severity 'INFO' -Message "Starting inventory for '$modFilter' on $($selected.Count) computer(s) ..."
                 }
-                Start-PSMMJobPoller -Operation 'Update'
+                else {
+                    Write-PSMMLog -Severity 'INFO' -Message "Starting inventory (all modules) on $($selected.Count) computer(s) ..."
+                }
+
+                # Mark existing rows for selected computers as scanning (observable update)
+                foreach ($item in $script:ModuleGrid) {
+                    if ($selected -contains $item.ComputerName) {
+                        $item.Status = 'Scanning...'
+                    }
+                }
+
+                # Launch async inventory
+                $null = Get-PSMMRemoteModules -ComputerNames $selected -ModuleName $modFilter
+
+                # Start polling via DispatcherTimer
+                Start-PSMMJobPoller -Operation 'Inventory'
             }
-        }
         })
 
-    # ── Remove ───────────────────────────────────────────────────────────────
-    $btnRemove = Find-PSMMControl -Window $Window -Name 'BtnRemove'
-    $btnRemove.Add_Click({
-        Invoke-PSMMSafeAction -Context 'Remove' -Action {
-            $grid = Find-PSMMControl -Window $script:MainWindow -Name 'ModuleDataGrid'
+    # -- Install ---------------------------------------------------------------
+    $sh.BtnInstall.Add_Click({
+            Invoke-PSMMSafeAction -Context 'Install' -Action {
+                $cmbMod = $script:SyncHash.CmbModule
+                $cmbVer = $script:SyncHash.CmbVersion
 
-            if ($grid.SelectedItems.Count -eq 0) {
-                [System.Windows.MessageBox]::Show('Select module rows to remove.', 'Info', 'OK', 'Information')
-                return
+                $selected = @($script:ComputerList | Where-Object { $_.IsSelected } | ForEach-Object { $_.Name })
+
+                if ($selected.Count -eq 0 -or -not $cmbMod.SelectedItem) {
+                    [System.Windows.MessageBox]::Show('Check computer(s) and select a module.', 'Info', 'OK', 'Information')
+                    return
+                }
+
+                $modName = $cmbMod.SelectedItem.ToString()
+                $version = if ($cmbVer.SelectedItem) { $cmbVer.SelectedItem.ToString() } else { $null }
+
+                $compList = ($selected | Select-Object -First 10) -join ", "
+                if ($selected.Count -gt 10) { $compList += " ... and $($selected.Count - 10) more" }
+                $confirm = [System.Windows.MessageBox]::Show(
+                    "Install $modName $(if ($version) {"v$version "})on $($selected.Count) computer(s)?`n`nComputers: $compList",
+                    'Confirm Install', 'YesNo', 'Question')
+
+                if ($confirm -eq 'Yes') {
+                    $null = Install-PSMMModule -ComputerNames $selected -ModuleName $modName -Version $version
+                    Start-PSMMJobPoller -Operation 'Install'
+                }
             }
+        })
 
-            # Build detailed confirmation with module/computer list
-            $detailLines = @()
-            foreach ($item in $grid.SelectedItems) {
-                $detailLines += "  $($item.ComputerName): $($item.ModuleName) v$($item.InstalledVersion)"
-            }
-            $detailText = ($detailLines | Select-Object -First 15) -join "`n"
-            if ($detailLines.Count -gt 15) { $detailText += "`n  ... and $($detailLines.Count - 15) more" }
-
-            $confirm = [System.Windows.MessageBox]::Show(
-                "Remove $($grid.SelectedItems.Count) module(s) from target computers? This cannot be undone.`n`n$detailText",
-                'Confirm Remove', 'YesNo', 'Warning')
-
-            if ($confirm -eq 'Yes') {
+    # -- Update ----------------------------------------------------------------
+    $sh.BtnUpdate.Add_Click({
+            Invoke-PSMMSafeAction -Context 'Update' -Action {
+                $grid = $script:SyncHash.ModuleDataGrid
+                $outdated = @()
                 foreach ($item in $grid.SelectedItems) {
-                    $null = Uninstall-PSMMModule -ComputerNames @($item.ComputerName) -ModuleName $item.ModuleName -Version $item.InstalledVersion -ModulePath $item.PSModulePath
+                    if ($item.Status -eq 'Outdated') { $outdated += $item }
                 }
-                Start-PSMMJobPoller -Operation 'Remove'
+
+                if ($outdated.Count -eq 0) {
+                    [System.Windows.MessageBox]::Show('Select outdated module rows in the grid.', 'Info', 'OK', 'Information')
+                    return
+                }
+
+                $detailLines = @()
+                foreach ($item in $outdated) {
+                    $detailLines += "  $($item.ComputerName): $($item.ModuleName) $($item.InstalledVersion) -> $($item.TargetVersion)"
+                }
+                $detailText = ($detailLines | Select-Object -First 15) -join "`n"
+                if ($detailLines.Count -gt 15) { $detailText += "`n  ... and $($detailLines.Count - 15) more" }
+
+                $confirm = [System.Windows.MessageBox]::Show(
+                    "Update $($outdated.Count) module(s)?`n`n$detailText",
+                    'Confirm Update', 'YesNo', 'Question')
+
+                if ($confirm -eq 'Yes') {
+                    foreach ($item in $outdated) {
+                        $null = Install-PSMMModule -ComputerNames @($item.ComputerName) -ModuleName $item.ModuleName -Version $item.TargetVersion
+                    }
+                    Start-PSMMJobPoller -Operation 'Update'
+                }
             }
-        }
         })
 
-    # ── Cancel Jobs ──────────────────────────────────────────────────────────
-    $btnCancel = Find-PSMMControl -Window $Window -Name 'BtnCancelJobs'
-    $btnCancel.Add_Click({
+    # -- Remove ----------------------------------------------------------------
+    $sh.BtnRemove.Add_Click({
+            Invoke-PSMMSafeAction -Context 'Remove' -Action {
+                $grid = $script:SyncHash.ModuleDataGrid
+
+                if ($grid.SelectedItems.Count -eq 0) {
+                    [System.Windows.MessageBox]::Show('Select module rows to remove.', 'Info', 'OK', 'Information')
+                    return
+                }
+
+                $detailLines = @()
+                foreach ($item in $grid.SelectedItems) {
+                    $detailLines += "  $($item.ComputerName): $($item.ModuleName) v$($item.InstalledVersion)"
+                }
+                $detailText = ($detailLines | Select-Object -First 15) -join "`n"
+                if ($detailLines.Count -gt 15) { $detailText += "`n  ... and $($detailLines.Count - 15) more" }
+
+                $confirm = [System.Windows.MessageBox]::Show(
+                    "Remove $($grid.SelectedItems.Count) module(s) from target computers? This cannot be undone.`n`n$detailText",
+                    'Confirm Remove', 'YesNo', 'Warning')
+
+                if ($confirm -eq 'Yes') {
+                    foreach ($item in $grid.SelectedItems) {
+                        $null = Uninstall-PSMMModule -ComputerNames @($item.ComputerName) -ModuleName $item.ModuleName -Version $item.InstalledVersion -ModulePath $item.PSModulePath
+                    }
+                    Start-PSMMJobPoller -Operation 'Remove'
+                }
+            }
+        })
+
+    # -- Cancel Jobs -----------------------------------------------------------
+    $sh.BtnCancelJobs.Add_Click({
             Stop-PSMMAllJobs
             Write-PSMMLog -Severity 'WARN' -Message 'All jobs cancelled by user.'
         })
 
-    # ── Select/Deselect All ──────────────────────────────────────────────────
-    $btnSelectAll = Find-PSMMControl -Window $Window -Name 'BtnSelectAll'
-    $btnSelectAll.Add_Click({
+    # -- Select All / Deselect All / Invert ------------------------------------
+    $sh.BtnSelectAll.Add_Click({
             foreach ($item in $script:ComputerList) { $item.IsSelected = $true }
         })
 
-    $btnDeselectAll = Find-PSMMControl -Window $Window -Name 'BtnDeselectAll'
-    $btnDeselectAll.Add_Click({
+    $sh.BtnDeselectAll.Add_Click({
             foreach ($item in $script:ComputerList) { $item.IsSelected = $false }
         })
 
-    $btnInvertSelect = Find-PSMMControl -Window $Window -Name 'BtnInvertSelect'
-    $btnInvertSelect.Add_Click({
+    $sh.BtnInvertSelect.Add_Click({
             foreach ($item in $script:ComputerList) { $item.IsSelected = -not $item.IsSelected }
         })
 
-    # ── Clear Module Grid ────────────────────────────────────────────────────
-    $btnClearGrid = Find-PSMMControl -Window $Window -Name 'BtnClearGrid'
-    $btnClearGrid.Add_Click({
+    # -- Clear Module Grid -----------------------------------------------------
+    $sh.BtnClearGrid.Add_Click({
             $script:ModuleGrid.Clear()
         })
 
-    # ── Export Inventory to CSV ──────────────────────────────────────────────
-    $btnExportCsv = Find-PSMMControl -Window $Window -Name 'BtnExportCsv'
-    $btnExportCsv.Add_Click({
-            Invoke-PSMMSafeAction -Context $script:MainWindow -Action {
+    # -- Export Inventory to CSV -----------------------------------------------
+    $sh.BtnExportCsv.Add_Click({
+            Invoke-PSMMSafeAction -Context 'Export CSV' -Action {
                 if ($script:ModuleGrid.Count -eq 0) {
                     [System.Windows.MessageBox]::Show('No inventory data to export.', 'Info', 'OK', 'Information')
                     return
@@ -2536,7 +2764,7 @@ function Register-PSMMMainWindowEvents {
                 $dlg.Title = 'Export Module Inventory'
                 $dlg.Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'
                 $dlg.FileName = "ModuleInventory_$(Get-Date -Format 'yyyy-MM-dd_HHmmss').csv"
-                if ($dlg.ShowDialog($script:MainWindow)) {
+                if ($dlg.ShowDialog($script:SyncHash.Window)) {
                     $rows = foreach ($item in $script:ModuleGrid) {
                         [PSCustomObject]@{
                             ComputerName     = $item.ComputerName
@@ -2555,10 +2783,9 @@ function Register-PSMMMainWindowEvents {
             }
         })
 
-    # ── Export Log ───────────────────────────────────────────────────────────
-    $btnExportLog = Find-PSMMControl -Window $Window -Name 'BtnExportLog'
-    $btnExportLog.Add_Click({
-            $logBox = Find-PSMMControl -Window $script:MainWindow -Name 'LogListBox'
+    # -- Export Log -------------------------------------------------------------
+    $sh.BtnExportLog.Add_Click({
+            $logBox = $script:SyncHash.LogListBox
             if ($logBox.Items.Count -eq 0) {
                 [System.Windows.MessageBox]::Show('No log entries to export.', 'Info', 'OK', 'Information')
                 return
@@ -2567,7 +2794,7 @@ function Register-PSMMMainWindowEvents {
             $dlg.Title = 'Export Log'
             $dlg.Filter = 'Log files (*.log)|*.log|Text files (*.txt)|*.txt|All files (*.*)|*.*'
             $dlg.FileName = "PS-ModuleManager_$(Get-Date -Format 'yyyy-MM-dd_HHmmss').log"
-            if ($dlg.ShowDialog($script:MainWindow)) {
+            if ($dlg.ShowDialog($script:SyncHash.Window)) {
                 try {
                     $logBox.Items | Out-File -FilePath $dlg.FileName -Encoding UTF8
                     Write-PSMMLog -Severity 'INFO' -Message "Log exported to $($dlg.FileName)"
@@ -2578,39 +2805,36 @@ function Register-PSMMMainWindowEvents {
             }
         })
 
-    # ── Clear Log ────────────────────────────────────────────────────────────
-    $btnClearLog = Find-PSMMControl -Window $Window -Name 'BtnClearLog'
-    $btnClearLog.Add_Click({
-            $logBox = Find-PSMMControl -Window $script:MainWindow -Name 'LogListBox'
-            $logBox.Items.Clear()
+    # -- Clear Log -------------------------------------------------------------
+    $sh.BtnClearLog.Add_Click({
+            $script:SyncHash.LogListBox.Items.Clear()
         })
 
-    # ── Settings ─────────────────────────────────────────────────────────────
-    $btnSettings = Find-PSMMControl -Window $Window -Name 'BtnSettings'
-    $btnSettings.Add_Click({ Show-PSMMSettingsDialog })
+    # -- Settings --------------------------------------------------------------
+    $sh.BtnSettings.Add_Click({ Show-PSMMSettingsDialog })
+    $sh.MenuSettings.Add_Click({ Show-PSMMSettingsDialog })
 
-    $menuSettings = Find-PSMMControl -Window $Window -Name 'MenuSettings'
-    $menuSettings.Add_Click({ Show-PSMMSettingsDialog })
-
-    # ── Credentials ──────────────────────────────────────────────────────────
-    $btnCred = Find-PSMMControl -Window $Window -Name 'BtnCredentials'
-    $btnCred.Add_Click({
-            $script:Credential = Get-Credential -Message 'Enter credentials for remote operations'
-            if ($script:Credential) {
-                Write-PSMMLog -Severity 'INFO' -Message "Credentials set for user: $($script:Credential.UserName)"
+    # -- Credentials -----------------------------------------------------------
+    # Uses a custom WPF credential dialog (no WinForms Get-Credential deadlock).
+    $sh.BtnCredentials.Add_Click({
+            Invoke-PSMMSafeAction -Context 'Credentials' -Action {
+                $cred = Show-PSMMCredentialDialog -Message 'Enter credentials for remote operations' -Owner $script:SyncHash.Window
+                if ($cred) {
+                    $script:Credential = $cred
+                    Write-PSMMLog -Severity 'INFO' -Message "Credentials set for user: $($cred.UserName)"
+                }
             }
         })
 
-    # ── Menu: Refresh AD ─────────────────────────────────────────────────────
-    $menuRefresh = Find-PSMMControl -Window $Window -Name 'MenuRefreshAD'
-    $menuRefresh.Add_Click({
-            $btnSearch = Find-PSMMControl -Window $script:MainWindow -Name 'BtnSearchAD'
-            $btnSearch.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+    # -- Menu: Refresh AD ------------------------------------------------------
+    $sh.MenuRefreshAD.Add_Click({
+            $script:SyncHash.BtnSearchAD.RaiseEvent(
+                [System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)
+            )
         })
 
-    # ── Menu: Test Connectivity ──────────────────────────────────────────────
-    $menuTestConn = Find-PSMMControl -Window $Window -Name 'MenuTestConn'
-    $menuTestConn.Add_Click({
+    # -- Menu: Test Connectivity -----------------------------------------------
+    $sh.MenuTestConn.Add_Click({
             $issues = Test-PSMMSettings
             if ($issues.Count -eq 0) {
                 [System.Windows.MessageBox]::Show('All settings are valid and paths are accessible.', 'Connectivity OK', 'OK', 'Information')
@@ -2620,33 +2844,28 @@ function Register-PSMMMainWindowEvents {
             }
         })
 
-    # ── Menu: Cancel All ─────────────────────────────────────────────────────
-    $menuCancel = Find-PSMMControl -Window $Window -Name 'MenuCancelJobs'
-    $menuCancel.Add_Click({
+    # -- Menu: Cancel All ------------------------------------------------------
+    $sh.MenuCancelJobs.Add_Click({
             Stop-PSMMAllJobs
             Write-PSMMLog -Severity 'WARN' -Message 'All jobs cancelled by user.'
         })
 
-    # ── Menu: About ──────────────────────────────────────────────────────────
-    $menuAbout = Find-PSMMControl -Window $Window -Name 'MenuAbout'
-    $menuAbout.Add_Click({
+    # -- Menu: About -----------------------------------------------------------
+    $sh.MenuAbout.Add_Click({
             [System.Windows.MessageBox]::Show(
-                "PS-ModuleManager v1.0.0`n`nA WPF-based PowerShell Module Manager for installing, updating, and removing modules on domain-joined computers.`n`nPowered by ADSI, WinRM, and Runspace Pools.",
+                "PS-ModuleManager v2.0.0`n`nA WPF-based PowerShell Module Manager for installing, updating, and removing modules on domain-joined computers.`n`nArchitecture: SyncHash + Dispatcher pattern`nPowered by ADSI, WinRM, and Runspace Pools.",
                 'About PS-ModuleManager', 'OK', 'Information')
         })
 
-    # ── Menu: Exit ───────────────────────────────────────────────────────────
-    $menuExit = Find-PSMMControl -Window $Window -Name 'MenuExit'
-    $menuExit.Add_Click({
-            $script:MainWindow.Close()
+    # -- Menu: Exit ------------------------------------------------------------
+    $sh.MenuExit.Add_Click({
+            $script:SyncHash.Window.Close()
         })
 
-    # ── Module ComboBox population ───────────────────────────────────────────
-    $cmbModule = Find-PSMMControl -Window $Window -Name 'CmbModule'
-    $cmbModule.Add_DropDownOpened({
-            $cmb = Find-PSMMControl -Window $script:MainWindow -Name 'CmbModule'
+    # -- Module ComboBox population --------------------------------------------
+    $sh.CmbModule.Add_DropDownOpened({
+            $cmb = $script:SyncHash.CmbModule
             $cmb.Items.Clear()
-
             $shareModules = Get-PSMMShareModules
             $moduleNames = $shareModules | Select-Object -ExpandProperty ModuleName -Unique | Sort-Object
             foreach ($name in $moduleNames) {
@@ -2654,10 +2873,10 @@ function Register-PSMMMainWindowEvents {
             }
         })
 
-    # ── Version ComboBox population (changes when module is selected) ────────
-    $cmbModule.Add_SelectionChanged({
-            $cmbMod = Find-PSMMControl -Window $script:MainWindow -Name 'CmbModule'
-            $cmbVer = Find-PSMMControl -Window $script:MainWindow -Name 'CmbVersion'
+    # -- Version ComboBox population -------------------------------------------
+    $sh.CmbModule.Add_SelectionChanged({
+            $cmbMod = $script:SyncHash.CmbModule
+            $cmbVer = $script:SyncHash.CmbVersion
             $cmbVer.Items.Clear()
 
             if ($cmbMod.SelectedItem) {
@@ -2673,28 +2892,25 @@ function Register-PSMMMainWindowEvents {
             }
         })
 
-    # ── Keyboard shortcuts ──────────────────────────────────────────────────
+    # -- Keyboard shortcuts ----------------------------------------------------
     $Window.Add_PreviewKeyDown({
-            param($sender, $e)
+            param($send, $e)
             $ctrl = [System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Control
             if ($ctrl) {
                 switch ($e.Key) {
                     'R' {
-                        # Ctrl+R -- Refresh inventory (click the Inventory button)
-                        $btn = $sender.FindName('BtnInventory')
+                        $btn = $send.FindName('BtnInventory')
                         if ($btn) {
                             $btn.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
                         }
                         $e.Handled = $true
                     }
                     'S' {
-                        # Ctrl+S -- Open Settings dialog
                         Show-PSMMSettingsDialog
                         $e.Handled = $true
                     }
                     'E' {
-                        # Ctrl+E -- Export inventory to CSV
-                        $btn = $sender.FindName('BtnExportCsv')
+                        $btn = $send.FindName('BtnExportCsv')
                         if ($btn) {
                             $btn.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
                         }
@@ -2703,14 +2919,13 @@ function Register-PSMMMainWindowEvents {
                 }
             }
             elseif ($e.Key -eq 'Escape') {
-                # Escape -- Cancel running jobs
                 Stop-PSMMAllJobs
                 Write-PSMMLog -Severity 'WARN' -Message 'Jobs cancelled by user (Escape key).'
                 $e.Handled = $true
             }
         })
 
-    # ── Window Closing cleanup ───────────────────────────────────────────────
+    # -- Window Closing cleanup ------------------------------------------------
     $Window.Add_Closing({
             Write-PSMMLog -Severity 'INFO' -Message 'Application closing -- cleaning up ...'
             Close-PSMMRunspacePool
@@ -2718,20 +2933,20 @@ function Register-PSMMMainWindowEvents {
 }
 #endregion WPF Event Handlers
 
+
 #region Job Poller
-# ─────────────────────────────────────────────────────────────────────────────
-# Dispatcher timer that polls runspace jobs and updates the UI.
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# DispatcherTimer that polls runspace jobs and updates the UI via syncHash.
+# ---------------------------------------------------------------------------
 
 function Start-PSMMJobPoller {
     <#
     .SYNOPSIS
         Starts a WPF DispatcherTimer that polls job completion and updates the UI.
     .DESCRIPTION
-        Uses $script:CurrentPollerOperation (not a local variable) so the tick
-        handler can reliably read the operation label even after this function
-        returns.  PowerShell .NET-event delegates do NOT capture function-local
-        variables the way C# lambdas do -- using $script: scope is the fix.
+        The timer tick handler uses $script:SyncHash to update UI controls
+        thread-safely via the WPF Dispatcher.  All grid/status updates go
+        through $syncHash.<Control> references.
     .PARAMETER Operation
         Label for the operation being polled (Inventory / Install / Update / Remove).
     #>
@@ -2740,59 +2955,76 @@ function Start-PSMMJobPoller {
         [string]$Operation = 'Operation'
     )
 
-    # ── Stop any previous poller ─────────────────────────────────────────────
+    # Stop any previous poller
     if ($script:JobPollerTimer) {
         try { $script:JobPollerTimer.Stop() } catch {}
         $script:JobPollerTimer = $null
     }
 
-    # ── Store operation in script scope so the tick closure can read it ──────
     $script:CurrentPollerOperation = $Operation
 
     $timer = [System.Windows.Threading.DispatcherTimer]::new()
     $timer.Interval = [TimeSpan]::FromMilliseconds(500)
     $script:JobPollerTimer = $timer
 
-    # ── Show progress bar ────────────────────────────────────────────────────
-    $progressBar = Find-PSMMControl -Window $script:MainWindow -Name 'StatusProgress'
-    if ($progressBar) {
-        $progressBar.IsIndeterminate = $true
-        $progressBar.Visibility = [System.Windows.Visibility]::Visible
+    # Show progress bar via syncHash
+    if ($script:SyncHash.StatusProgress) {
+        $script:SyncHash.StatusProgress.IsIndeterminate = $true
+        $script:SyncHash.StatusProgress.Visibility = [System.Windows.Visibility]::Visible
     }
 
     $timer.Add_Tick({
             try {
-                # ── 1. Harvest completed jobs ────────────────────────────────
+                # 1. Harvest completed jobs
                 $completed = Receive-PSMMJobs
-                $running   = @($script:Jobs | Where-Object { $_.Status -eq 'Running' }).Count
+                $running = @($script:Jobs | Where-Object { $_.Status -eq 'Running' }).Count
 
-                # ── 2. Update status bar ─────────────────────────────────────
-                $statusJobs = Find-PSMMControl -Window $script:MainWindow -Name 'StatusJobs'
-                if ($statusJobs) {
+                # 2. Update status bar via syncHash
+                if ($script:SyncHash.StatusJobs) {
                     $total = $script:Jobs.Count
-                    $done  = @($script:Jobs | Where-Object { $_.Status -ne 'Running' }).Count
-                    $statusJobs.Text = "Jobs: $done / $total  |  Running: $running  |  Pool: $($script:Settings.MaxConcurrency)"
+                    $done = @($script:Jobs | Where-Object { $_.Status -ne 'Running' }).Count
+                    $script:SyncHash.StatusJobs.Text = "Jobs: $done / $total  |  Running: $running  |  Pool: $($script:Settings.MaxConcurrency)"
                 }
 
-                # ── 3. Process completed results ─────────────────────────────
-                $addedCount = 0
+                # 3. Process completed results -- update existing items in-place or add new ones
+                $changedCount = 0
                 foreach ($job in $completed) {
                     if (-not $job.Result) { continue }
                     foreach ($result in $job.Result) {
                         if ($result -is [PSCustomObject] -and $result.PSObject.Properties['ModuleName']) {
                             if ($result.ModuleName -eq '_ERROR_') { continue }
 
-                            $script:ModuleGrid.Add([ModuleGridItem]@{
-                                    ComputerName     = $result.ComputerName
-                                    ModuleName       = $result.ModuleName
-                                    InstalledVersion = $result.InstalledVersion
-                                    TargetVersion    = ''
-                                    Status           = 'Scanned'
-                                    Model            = $result.Model
-                                    OS               = $result.OS
-                                    PSModulePath     = $result.ModuleBase
-                                })
-                            $addedCount++
+                            # Look for an existing row to update in-place (INotifyPropertyChanged handles UI)
+                            $existing = $null
+                            foreach ($row in $script:ModuleGrid) {
+                                if ($row.ComputerName -eq $result.ComputerName -and $row.ModuleName -eq $result.ModuleName) {
+                                    $existing = $row
+                                    break
+                                }
+                            }
+
+                            if ($existing) {
+                                # Update in-place -- WPF auto-reflects via INotifyPropertyChanged
+                                $existing.InstalledVersion = $result.InstalledVersion
+                                $existing.Status = 'Scanned'
+                                $existing.Model = $result.Model
+                                $existing.OS = $result.OS
+                                $existing.PSModulePath = $result.ModuleBase
+                            }
+                            else {
+                                # New module not yet in grid -- add it
+                                $script:ModuleGrid.Add([ModuleGridItem]@{
+                                        ComputerName     = $result.ComputerName
+                                        ModuleName       = $result.ModuleName
+                                        InstalledVersion = $result.InstalledVersion
+                                        TargetVersion    = ''
+                                        Status           = 'Scanned'
+                                        Model            = $result.Model
+                                        OS               = $result.OS
+                                        PSModulePath     = $result.ModuleBase
+                                    })
+                            }
+                            $changedCount++
                         }
                         elseif ($result -is [string]) {
                             Write-PSMMLog -Severity 'INFO' -Message $result -ComputerName $job.ComputerName
@@ -2800,78 +3032,97 @@ function Start-PSMMJobPoller {
                     }
                 }
 
-                # ── 4. Force the DataGrid to repaint if rows were added ──────
-                if ($addedCount -gt 0) {
-                    $grid = Find-PSMMControl -Window $script:MainWindow -Name 'ModuleDataGrid'
-                    if ($grid) {
-                        $grid.Items.Refresh()
-                        $grid.UpdateLayout()
-                    }
-                    Write-PSMMLog -Severity 'DEBUG' -Message "Poller: added $addedCount row(s) to grid (total: $($script:ModuleGrid.Count))."
+                # 4. Log changes (no forced repaint needed -- ObservableCollection + INotifyPropertyChanged handle it)
+                if ($changedCount -gt 0) {
+                    Write-PSMMLog -Severity 'DEBUG' -Message "Poller: updated/added $changedCount row(s) in grid (total: $($script:ModuleGrid.Count))."
                 }
 
-                # ── 5. All jobs finished? ────────────────────────────────────
+                # 5. All jobs finished?
                 if ($running -eq 0 -and $script:Jobs.Count -gt 0) {
-                    # Stop this timer
                     if ($script:JobPollerTimer) {
                         try { $script:JobPollerTimer.Stop() } catch {}
                         $script:JobPollerTimer = $null
                     }
 
-                    # ── Hide progress bar ────────────────────────────────────
-                    $progressBar = Find-PSMMControl -Window $script:MainWindow -Name 'StatusProgress'
-                    if ($progressBar) {
-                        $progressBar.IsIndeterminate = $false
-                        $progressBar.Visibility = [System.Windows.Visibility]::Collapsed
+                    # Hide progress bar
+                    if ($script:SyncHash.StatusProgress) {
+                        $script:SyncHash.StatusProgress.IsIndeterminate = $false
+                        $script:SyncHash.StatusProgress.Visibility = [System.Windows.Visibility]::Collapsed
                     }
 
                     Write-PSMMLog -Severity 'INFO' -Message "All jobs completed. Grid rows: $($script:ModuleGrid.Count)"
 
-                    # ── 5a. Version comparison ───────────────────────────────
+                    # 5a. Version comparison -- update existing grid items in-place
                     $shareModules = Get-PSMMShareModules
                     if ($shareModules.Count -gt 0 -and $script:ModuleGrid.Count -gt 0) {
-                        $gridItems = @($script:ModuleGrid)
-                        $compared  = Compare-PSMMModuleVersions -InstalledModules $gridItems -ShareModules $shareModules
-
-                        $script:ModuleGrid.Clear()
-                        foreach ($c in $compared) {
-                            $script:ModuleGrid.Add($c)
+                        # Build lookup: module name -> latest version on share
+                        $latestOnShare = @{}
+                        foreach ($sm in $shareModules) {
+                            try {
+                                $ver = [Version]$sm.Version
+                                if (-not $latestOnShare.ContainsKey($sm.ModuleName) -or $ver -gt [Version]$latestOnShare[$sm.ModuleName]) {
+                                    $latestOnShare[$sm.ModuleName] = $sm.Version
+                                }
+                            }
+                            catch { <# skip unparseable versions #> }
                         }
 
-                        # Force grid to show the enriched data
-                        $grid = Find-PSMMControl -Window $script:MainWindow -Name 'ModuleDataGrid'
-                        if ($grid) {
-                            $grid.Items.Refresh()
-                            $grid.UpdateLayout()
+                        # Update each grid item in-place (INotifyPropertyChanged propagates to UI)
+                        foreach ($item in $script:ModuleGrid) {
+                            $target = $latestOnShare[$item.ModuleName]
+                            $item.TargetVersion = if ($target) { $target } else { '' }
+
+                            $item.Status = if (-not $target) {
+                                'Unknown'
+                            }
+                            elseif (-not $item.InstalledVersion) {
+                                'Missing'
+                            }
+                            else {
+                                try {
+                                    $cmp = [Version]$item.InstalledVersion
+                                    $tgt = [Version]$target
+                                    if ($cmp -ge $tgt) { 'UpToDate' } else { 'Outdated' }
+                                }
+                                catch { 'Unknown' }
+                            }
                         }
-                        Write-PSMMLog -Severity 'DEBUG' -Message "Version comparison done. Grid rows: $($script:ModuleGrid.Count)"
+
+                        Write-PSMMLog -Severity 'DEBUG' -Message "Version comparison done (in-place). Grid rows: $($script:ModuleGrid.Count)"
                     }
 
-                    # ── 5b. Auto-refresh after Install/Update/Remove ─────────
-                    # NOTE: uses $script:CurrentPollerOperation -- NOT a local variable
+                    # 5a-cleanup. Remove stale rows still stuck at transient status
+                    # (e.g. a module was uninstalled so no result came back for it)
+                    $staleRows = @($script:ModuleGrid | Where-Object { $_.Status -in @('Scanning...', 'Refreshing...') })
+                    if ($staleRows.Count -gt 0) {
+                        foreach ($stale in $staleRows) { $script:ModuleGrid.Remove($stale) }
+                        Write-PSMMLog -Severity 'DEBUG' -Message "Removed $($staleRows.Count) stale row(s) with no matching scan result."
+                    }
+
+                    # 5b. Auto-refresh after Install/Update/Remove
                     $currentOp = $script:CurrentPollerOperation
                     if ($currentOp -in @('Install', 'Update', 'Remove')) {
                         $affectedComputers = @(
                             $script:Jobs |
-                                Where-Object { $_.Status -ne 'Running' } |
-                                ForEach-Object { $_.ComputerName } |
-                                Select-Object -Unique
+                            Where-Object { $_.Status -ne 'Running' } |
+                            ForEach-Object { $_.ComputerName } |
+                            Select-Object -Unique
                         )
                         if ($affectedComputers.Count -gt 0) {
                             Write-PSMMLog -Severity 'INFO' -Message "Auto-refreshing inventory for $($affectedComputers.Count) computer(s) after $currentOp ..."
 
-                            # Clear grid rows for affected computers
-                            $toRemove = @($script:ModuleGrid | Where-Object { $affectedComputers -contains $_.ComputerName })
-                            foreach ($item in $toRemove) { $script:ModuleGrid.Remove($item) }
+                            # Mark affected rows as refreshing (observable in-place update)
+                            foreach ($item in $script:ModuleGrid) {
+                                if ($affectedComputers -contains $item.ComputerName) {
+                                    $item.Status = 'Refreshing...'
+                                }
+                            }
 
-                            # Module filter from combo box
-                            $cmbMod    = Find-PSMMControl -Window $script:MainWindow -Name 'CmbModule'
+                            $cmbMod = $script:SyncHash.CmbModule
                             $modFilter = if ($cmbMod -and $cmbMod.SelectedItem) { $cmbMod.SelectedItem.ToString() } else { $null }
 
-                            # Reset jobs list so new poller starts clean
                             $script:Jobs.Clear()
 
-                            # Launch inventory and start a fresh poller
                             $null = Get-PSMMRemoteModules -ComputerNames $affectedComputers -ModuleName $modFilter
                             Start-PSMMJobPoller -Operation 'Inventory'
                         }
@@ -2880,7 +3131,6 @@ function Start-PSMMJobPoller {
             }
             catch {
                 Write-PSMMLog -Severity 'ERROR' -Message "Job poller tick error: $_"
-                # Do NOT kill the timer on transient errors -- only stop if truly fatal
             }
         })
 
@@ -2889,8 +3139,9 @@ function Start-PSMMJobPoller {
 }
 #endregion Job Poller
 
+
 #region ADSI Helper
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 function Get-ADSIInfo {
     <#
     .SYNOPSIS
@@ -2900,7 +3151,6 @@ function Get-ADSIInfo {
         LDAP path and enumerate available OUs for use in settings.json.
     #>
 
-    # ── Get Domain LDAP Path ────────────────────────────────────────────────────
     try {
         $rootDSE = [ADSI]"LDAP://RootDSE"
         $defaultNC = $rootDSE.defaultNamingContext.ToString()
@@ -2916,8 +3166,8 @@ function Get-ADSIInfo {
         Write-Host $_.Exception.Message -ForegroundColor DarkYellow
 
         $localName = $env:COMPUTERNAME
-        $localDns  = try { [System.Net.Dns]::GetHostEntry('').HostName } catch { $localName }
-        $localOS   = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
+        $localDns = try { [System.Net.Dns]::GetHostEntry('').HostName } catch { $localName }
+        $localOS = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
 
         Write-Host "`n=== Local Computer Info ===" -ForegroundColor Cyan
         Write-Host "Computer Name : " -NoNewline; Write-Host $localName -ForegroundColor Green
@@ -2928,7 +3178,6 @@ function Get-ADSIInfo {
         return
     }
 
-    # ── Enumerate OUs ───────────────────────────────────────────────────────────
     Write-Host "`n=== Available OUs ===" -ForegroundColor Cyan
 
     $searcher = [ADSISearcher]"(objectClass=organizationalUnit)"
@@ -2951,7 +3200,6 @@ function Get-ADSIInfo {
         Write-Host "Found $($ous.Count) OU(s):`n"
         $ous | Format-Table -Property Name, DistinguishedName, Description -AutoSize -Wrap
 
-        # ── Suggested settings.json values ──────────────────────────────────────
         Write-Host "=== Suggested settings.json values ===" -ForegroundColor Cyan
         Write-Host '"DomainLdapPath": "' -NoNewline
         Write-Host $domainLdapPath -ForegroundColor Green -NoNewline
@@ -2965,10 +3213,11 @@ function Get-ADSIInfo {
 }
 #endregion ADSI Helper
 
+
 #region Settings Dialog
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # WPF settings editor modal dialog.
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 function Show-PSMMSettingsDialog {
     <#
@@ -2979,47 +3228,46 @@ function Show-PSMMSettingsDialog {
     param()
 
     $settingsWin = New-PSMMWindow -Xaml $script:SettingsDialogXaml
-    $settingsWin.Owner = $script:MainWindow
+    $settingsWin.Owner = $script:SyncHash.Window
 
-    # Cache references to avoid Find-PSMMControl inside closures (closure scope cannot resolve module-private functions)
-    $txtLdap         = $settingsWin.FindName('TxtSettLdap')
-    $txtOu           = $settingsWin.FindName('TxtSettOu')
-    $txtSearchPaths  = $settingsWin.FindName('TxtSettSearchPaths')
-    $txtShare        = $settingsWin.FindName('TxtSettShare')
-    $txtLogPath      = $settingsWin.FindName('TxtSettLogPath')
-    $txtConcurrency  = $settingsWin.FindName('TxtSettConcurrency')
-    $txtRetry        = $settingsWin.FindName('TxtSettRetry')
-    $txtTimeout      = $settingsWin.FindName('TxtSettTimeout')
-    $credCombo       = $settingsWin.FindName('CmbSettCredMode')
-    $logCombo        = $settingsWin.FindName('CmbSettLogLevel')
-    $chkReachability   = $settingsWin.FindName('ChkReachability')
-    $chkExclServers    = $settingsWin.FindName('ChkExcludeServers')
-    $chkExclVirtual    = $settingsWin.FindName('ChkExcludeVirtual')
-    $txtOsFilter       = $settingsWin.FindName('TxtOsFilter')
-    $btnSave           = $settingsWin.FindName('BtnSettSave')
-    $btnCancel       = $settingsWin.FindName('BtnSettCancel')
-    $btnTestShare    = $settingsWin.FindName('BtnTestShare')
-    $btnTestAD       = $settingsWin.FindName('BtnTestAD')
-    $btnSettImport   = $settingsWin.FindName('BtnSettImport')
-    $btnSettExport   = $settingsWin.FindName('BtnSettExport')
+    # Cache references to avoid closure issues
+    $txtLdap = $settingsWin.FindName('TxtSettLdap')
+    $txtOu = $settingsWin.FindName('TxtSettOu')
+    $txtSearchPaths = $settingsWin.FindName('TxtSettSearchPaths')
+    $txtShare = $settingsWin.FindName('TxtSettShare')
+    $txtLogPath = $settingsWin.FindName('TxtSettLogPath')
+    $txtConcurrency = $settingsWin.FindName('TxtSettConcurrency')
+    $txtRetry = $settingsWin.FindName('TxtSettRetry')
+    $txtTimeout = $settingsWin.FindName('TxtSettTimeout')
+    $credCombo = $settingsWin.FindName('CmbSettCredMode')
+    $logCombo = $settingsWin.FindName('CmbSettLogLevel')
+    $chkReachability = $settingsWin.FindName('ChkReachability')
+    $chkExclServers = $settingsWin.FindName('ChkExcludeServers')
+    $chkExclVirtual = $settingsWin.FindName('ChkExcludeVirtual')
+    $txtOsFilter = $settingsWin.FindName('TxtOsFilter')
+    $btnSave = $settingsWin.FindName('BtnSettSave')
+    $btnCancel = $settingsWin.FindName('BtnSettCancel')
+    $btnTestShare = $settingsWin.FindName('BtnTestShare')
+    $btnTestAD = $settingsWin.FindName('BtnTestAD')
+    $btnSettImport = $settingsWin.FindName('BtnSettImport')
+    $btnSettExport = $settingsWin.FindName('BtnSettExport')
 
-    # Populate fields
-    $txtLdap.Text        = $script:Settings.DomainLdapPath
-    $txtOu.Text          = $script:Settings.OuFilter
-    $txtShare.Text       = $script:Settings.CentralSharePath
-    $txtLogPath.Text     = $script:Settings.LogPath
+    # Populate fields from current settings
+    $txtLdap.Text = $script:Settings.DomainLdapPath
+    $txtOu.Text = $script:Settings.OuFilter
+    $txtShare.Text = $script:Settings.CentralSharePath
+    $txtLogPath.Text = $script:Settings.LogPath
     $txtConcurrency.Text = $script:Settings.MaxConcurrency.ToString()
-    $txtRetry.Text       = $script:Settings.RetryCount.ToString()
-    $txtTimeout.Text     = $script:Settings.JobTimeoutSeconds.ToString()
+    $txtRetry.Text = $script:Settings.RetryCount.ToString()
+    $txtTimeout.Text = $script:Settings.JobTimeoutSeconds.ToString()
 
-    # ModuleSearchPaths: join array to comma-separated string for display
     if ($script:Settings.ModuleSearchPaths -is [System.Collections.IEnumerable] -and $script:Settings.ModuleSearchPaths -isnot [string]) {
         $txtSearchPaths.Text = ($script:Settings.ModuleSearchPaths -join ', ')
-    } else {
+    }
+    else {
         $txtSearchPaths.Text = [string]$script:Settings.ModuleSearchPaths
     }
 
-    # Set combo selections
     foreach ($item in $credCombo.Items) {
         if ($item.Content -eq $script:Settings.CredentialMode) {
             $credCombo.SelectedItem = $item
@@ -3035,29 +3283,28 @@ function Show-PSMMSettingsDialog {
     }
 
     $chkReachability.IsChecked = [bool]$script:Settings.ReachabilityCheck
-    $chkExclServers.IsChecked    = [bool]$script:Settings.ExcludeServers
-    $chkExclVirtual.IsChecked    = [bool]$script:Settings.ExcludeVirtual
-    $txtOsFilter.Text            = $script:Settings.OSFilter
+    $chkExclServers.IsChecked = [bool]$script:Settings.ExcludeServers
+    $chkExclVirtual.IsChecked = [bool]$script:Settings.ExcludeVirtual
+    $txtOsFilter.Text = $script:Settings.OSFilter
 
-    # Capture module-scoped references as local variables so .GetNewClosure() can see them
-    $settings        = $script:Settings          # hashtable reference -- mutations propagate
-    $mainWin         = $script:MainWindow        # main window reference for syncing toolbar
-    $fnTestSettings  = ${function:Test-PSMMSettings}
+    # Capture module-scoped references for .GetNewClosure()
+    $settings = $script:Settings
+    $syncHash = $script:SyncHash
+    $fnTestSettings = ${function:Test-PSMMSettings}
     $fnExportSettings = ${function:Export-PSMMSettings}
     $fnImportSettings = ${function:Import-PSMMSettings}
-    $fnWriteLog      = ${function:Write-PSMMLog}
+    $fnWriteLog = ${function:Write-PSMMLog}
 
-    # ── Save ─────────────────────────────────────────────────────────────────
+    # -- Save ---
     $btnSave.Add_Click({
-            $settings['DomainLdapPath']    = $txtLdap.Text
-            $settings['OuFilter']          = $txtOu.Text
-            $settings['CentralSharePath']  = $txtShare.Text
-            $settings['LogPath']           = $txtLogPath.Text
-            $settings['MaxConcurrency']    = [int]($txtConcurrency.Text)
-            $settings['RetryCount']        = [int]($txtRetry.Text)
+            $settings['DomainLdapPath'] = $txtLdap.Text
+            $settings['OuFilter'] = $txtOu.Text
+            $settings['CentralSharePath'] = $txtShare.Text
+            $settings['LogPath'] = $txtLogPath.Text
+            $settings['MaxConcurrency'] = [int]($txtConcurrency.Text)
+            $settings['RetryCount'] = [int]($txtRetry.Text)
             $settings['JobTimeoutSeconds'] = [int]($txtTimeout.Text)
 
-            # Parse ModuleSearchPaths from comma-separated string back to array
             $settings['ModuleSearchPaths'] = @($txtSearchPaths.Text -split '\s*,\s*' | Where-Object { $_ -ne '' })
 
             $credSel = $credCombo.SelectedItem
@@ -3067,11 +3314,10 @@ function Show-PSMMSettingsDialog {
             if ($logSel) { $settings['LogLevel'] = $logSel.Content.ToString() }
 
             $settings['ReachabilityCheck'] = [bool]$chkReachability.IsChecked
-            $settings['ExcludeServers']    = [bool]$chkExclServers.IsChecked
-            $settings['ExcludeVirtual']    = [bool]$chkExclVirtual.IsChecked
-            $settings['OSFilter']          = $txtOsFilter.Text
+            $settings['ExcludeServers'] = [bool]$chkExclServers.IsChecked
+            $settings['ExcludeVirtual'] = [bool]$chkExclVirtual.IsChecked
+            $settings['OSFilter'] = $txtOsFilter.Text
 
-            # Validate
             $issues = & $fnTestSettings -Settings $settings
             if ($issues.Count -gt 0) {
                 [System.Windows.MessageBox]::Show(($issues -join "`n"), 'Validation Issues', 'OK', 'Warning')
@@ -3081,30 +3327,23 @@ function Show-PSMMSettingsDialog {
             & $fnExportSettings -Settings $settings
             & $fnWriteLog -Severity 'INFO' -Message 'Settings saved successfully.'
 
-            # ── Sync main window toolbar controls with saved settings ────────
-            if ($mainWin) {
-                # Skip Servers / Skip Virtual checkboxes
-                $chkSrv = $mainWin.FindName('ChkSkipServers')
-                if ($chkSrv) { $chkSrv.IsChecked = [bool]$settings['ExcludeServers'] }
-
-                $chkVm = $mainWin.FindName('ChkSkipVirtual')
-                if ($chkVm) { $chkVm.IsChecked = [bool]$settings['ExcludeVirtual'] }
-
-                # OU filter text box
-                $ouBox = $mainWin.FindName('TxtOuFilter')
-                if ($ouBox) { $ouBox.Text = [string]$settings['OuFilter'] }
+            # Sync main window toolbar controls via syncHash
+            if ($syncHash.Window) {
+                if ($syncHash.ChkSkipServers) { $syncHash.ChkSkipServers.IsChecked = [bool]$settings['ExcludeServers'] }
+                if ($syncHash.ChkSkipVirtual) { $syncHash.ChkSkipVirtual.IsChecked = [bool]$settings['ExcludeVirtual'] }
+                if ($syncHash.TxtOuFilter) { $syncHash.TxtOuFilter.Text = [string]$settings['OuFilter'] }
             }
 
             $settingsWin.Close()
         }.GetNewClosure())
 
-    # ── Cancel ───────────────────────────────────────────────────────────────
+    # -- Cancel ---
     $btnCancel.Add_Click({ $settingsWin.Close() }.GetNewClosure())
 
-    # ── Import Settings ──────────────────────────────────────────────────────
+    # -- Import Settings ---
     $btnSettImport.Add_Click({
             $dlg = [Microsoft.Win32.OpenFileDialog]::new()
-            $dlg.Title  = 'Import Settings'
+            $dlg.Title = 'Import Settings'
             $dlg.Filter = 'JSON files (*.json)|*.json|All files (*.*)|*.*'
             if ($dlg.ShowDialog($settingsWin)) {
                 try {
@@ -3113,18 +3352,18 @@ function Show-PSMMSettingsDialog {
                         [System.Windows.MessageBox]::Show('Failed to load settings from the selected file.', 'Import Error', 'OK', 'Error')
                         return
                     }
-                    # Update UI fields from imported settings
-                    $txtLdap.Text        = if ($imported.DomainLdapPath)    { $imported.DomainLdapPath }    else { '' }
-                    $txtOu.Text          = if ($imported.OuFilter)          { $imported.OuFilter }          else { '' }
-                    $txtShare.Text       = if ($imported.CentralSharePath)  { $imported.CentralSharePath }  else { '' }
-                    $txtLogPath.Text     = if ($imported.LogPath)           { $imported.LogPath }           else { '' }
-                    $txtConcurrency.Text = if ($imported.MaxConcurrency)    { $imported.MaxConcurrency.ToString() } else { '4' }
-                    $txtRetry.Text       = if ($imported.RetryCount)        { $imported.RetryCount.ToString() }     else { '2' }
-                    $txtTimeout.Text     = if ($imported.JobTimeoutSeconds) { $imported.JobTimeoutSeconds.ToString() } else { '300' }
+                    $txtLdap.Text = if ($imported.DomainLdapPath) { $imported.DomainLdapPath }    else { '' }
+                    $txtOu.Text = if ($imported.OuFilter) { $imported.OuFilter }          else { '' }
+                    $txtShare.Text = if ($imported.CentralSharePath) { $imported.CentralSharePath }  else { '' }
+                    $txtLogPath.Text = if ($imported.LogPath) { $imported.LogPath }           else { '' }
+                    $txtConcurrency.Text = if ($imported.MaxConcurrency) { $imported.MaxConcurrency.ToString() } else { '4' }
+                    $txtRetry.Text = if ($imported.RetryCount) { $imported.RetryCount.ToString() }     else { '2' }
+                    $txtTimeout.Text = if ($imported.JobTimeoutSeconds) { $imported.JobTimeoutSeconds.ToString() } else { '300' }
 
                     if ($imported.ModuleSearchPaths -is [System.Collections.IEnumerable] -and $imported.ModuleSearchPaths -isnot [string]) {
                         $txtSearchPaths.Text = ($imported.ModuleSearchPaths -join ', ')
-                    } elseif ($imported.ModuleSearchPaths) {
+                    }
+                    elseif ($imported.ModuleSearchPaths) {
                         $txtSearchPaths.Text = [string]$imported.ModuleSearchPaths
                     }
 
@@ -3140,8 +3379,8 @@ function Show-PSMMSettingsDialog {
                     }
 
                     $chkReachability.IsChecked = if ($null -ne $imported.ReachabilityCheck) { [bool]$imported.ReachabilityCheck } else { $true }
-                    $chkExclServers.IsChecked  = if ($null -ne $imported.ExcludeServers)    { [bool]$imported.ExcludeServers }    else { $false }
-                    $chkExclVirtual.IsChecked  = if ($null -ne $imported.ExcludeVirtual)    { [bool]$imported.ExcludeVirtual }    else { $false }
+                    $chkExclServers.IsChecked = if ($null -ne $imported.ExcludeServers) { [bool]$imported.ExcludeServers }    else { $false }
+                    $chkExclVirtual.IsChecked = if ($null -ne $imported.ExcludeVirtual) { [bool]$imported.ExcludeVirtual }    else { $false }
 
                     & $fnWriteLog -Severity 'INFO' -Message "Settings imported from $($dlg.FileName) -- click Save to apply."
                     [System.Windows.MessageBox]::Show("Settings loaded from:`n$($dlg.FileName)`n`nReview values and click Save to apply.", 'Import Successful', 'OK', 'Information')
@@ -3152,11 +3391,11 @@ function Show-PSMMSettingsDialog {
             }
         }.GetNewClosure())
 
-    # ── Export Settings ──────────────────────────────────────────────────────
+    # -- Export Settings ---
     $btnSettExport.Add_Click({
             $dlg = [Microsoft.Win32.SaveFileDialog]::new()
-            $dlg.Title    = 'Export Settings'
-            $dlg.Filter   = 'JSON files (*.json)|*.json|All files (*.*)|*.*'
+            $dlg.Title = 'Export Settings'
+            $dlg.Filter = 'JSON files (*.json)|*.json|All files (*.*)|*.*'
             $dlg.FileName = "PS-ModuleManager-Settings_$(Get-Date -Format 'yyyy-MM-dd').json"
             if ($dlg.ShowDialog($settingsWin)) {
                 try {
@@ -3170,7 +3409,7 @@ function Show-PSMMSettingsDialog {
             }
         }.GetNewClosure())
 
-    # ── Test Share ───────────────────────────────────────────────────────────
+    # -- Test Share ---
     $btnTestShare.Add_Click({
             $sharePath = $txtShare.Text
             if ([string]::IsNullOrWhiteSpace($sharePath)) {
@@ -3184,7 +3423,7 @@ function Show-PSMMSettingsDialog {
             }
         }.GetNewClosure())
 
-    # ── Test AD ──────────────────────────────────────────────────────────────
+    # -- Test AD ---
     $btnTestAD.Add_Click({
             try {
                 $ldap = $txtLdap.Text
@@ -3201,10 +3440,11 @@ function Show-PSMMSettingsDialog {
 }
 #endregion Settings Dialog
 
+
 #region Exported Function
-# ─────────────────────────────────────────────────────────────────────────────
-# The single public entry-point for the module.
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# The public entry-points for the module.
+# ---------------------------------------------------------------------------
 
 function Show-ModuleManagerGUI {
     <#
@@ -3216,19 +3456,19 @@ function Show-ModuleManagerGUI {
         can discover domain-joined computers via ADSI, inventory installed PowerShell
         modules, and install / update / remove modules from a central network share.
 
+        Architecture: SyncHash + Dispatcher pattern
         All operations are executed in parallel using a runspace pool, with real-time
-        progress and logging visible in the application window.
+        progress and logging visible in the application window.  Background runspaces
+        update the UI thread-safely via $syncHash.Window.Dispatcher.Invoke().
 
     .PARAMETER SettingsPath
-        Path to a custom settings.json file.  If not specified, the module looks for
-        settings.json in the same directory as the module file.
+        Path to a custom settings.json file.
 
     .PARAMETER WindowStartupLocation
         Specifies the initial position of the main window.  Default is 'CenterScreen'.
-        Other options: 'Manual', 'WindowsDefaultLocation', 'WindowsDefaultBounds', 'CenterOwner'.
 
     .PARAMETER WindowState
-        Specifies the initial window state.  Default is 'Normal'.  Other options: 'Minimized', 'Maximized'.
+        Specifies the initial window state.  Default is 'Normal'.
 
     .EXAMPLE
         Show-ModuleManagerGUI
@@ -3261,59 +3501,61 @@ function Show-ModuleManagerGUI {
         [string]$WindowState = 'Normal'
     )
 
-    Write-Host 'Starting PS-ModuleManager ...' -ForegroundColor Cyan
+    Write-Host 'Starting PS-ModuleManager v2.0.0 (SyncHash architecture) ...' -ForegroundColor Cyan
 
-    # ── Admin check ───────────────────────────────────────────────────────────
-    $script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    # -- Admin check ---
+    $script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator
+    )
     if (-not $script:IsAdmin) {
         Write-Host 'WARNING: Not running as Administrator. Install/Update/Remove operations will fail for system-wide module paths.' -ForegroundColor Yellow
     }
 
-    # ── Load settings ────────────────────────────────────────────────────────
+    # -- Load settings ---
     $script:SettingsPath = $SettingsPath
     Import-PSMMSettings -Path $SettingsPath
 
-    # ── Log rotation ─────────────────────────────────────────────────────────
+    # -- Log rotation ---
     Invoke-PSMMLogRotation
 
-    # ── Initialize runspace pool ─────────────────────────────────────────────
+    # -- Initialize runspace pool ---
     New-PSMMRunspacePool
 
-    # ── Handle credentials ───────────────────────────────────────────────────
+    # -- Handle credentials ---
     if ($script:Settings.CredentialMode -eq 'Prompt') {
         Get-PSMMCredential
     }
 
-    # ── Build WPF window ────────────────────────────────────────────────────
-    $script:MainWindow = New-PSMMWindow -Xaml $script:MainWindowXaml
+    # -- Build WPF window ---
+    $window = New-PSMMWindow -Xaml $script:MainWindowXaml
 
-    # Populate toolbar defaults from settings
-    $ouBox = Find-PSMMControl -Window $script:MainWindow -Name 'TxtOuFilter'
-    if ($ouBox -and $script:Settings.OuFilter) {
-        $ouBox.Text = $script:Settings.OuFilter
+    # -- Initialize the SyncHash with all named controls ---
+    Initialize-PSMMSyncHash -Window $window
+
+    # -- Populate toolbar defaults from settings ---
+    if ($script:SyncHash.TxtOuFilter -and $script:Settings.OuFilter) {
+        $script:SyncHash.TxtOuFilter.Text = $script:Settings.OuFilter
     }
 
-    # Set toolbar checkboxes from saved settings
-    $chkSkipSrv = Find-PSMMControl -Window $script:MainWindow -Name 'ChkSkipServers'
-    if ($chkSkipSrv) { $chkSkipSrv.IsChecked = [bool]$script:Settings.ExcludeServers }
-    $chkSkipVm = Find-PSMMControl -Window $script:MainWindow -Name 'ChkSkipVirtual'
-    if ($chkSkipVm) { $chkSkipVm.IsChecked = [bool]$script:Settings.ExcludeVirtual }
+    if ($script:SyncHash.ChkSkipServers) {
+        $script:SyncHash.ChkSkipServers.IsChecked = [bool]$script:Settings.ExcludeServers
+    }
+    if ($script:SyncHash.ChkSkipVirtual) {
+        $script:SyncHash.ChkSkipVirtual.IsChecked = [bool]$script:Settings.ExcludeVirtual
+    }
 
-    # ── Wire event handlers ──────────────────────────────────────────────────
-    Register-PSMMMainWindowEvents -Window $script:MainWindow
+    # -- Wire event handlers ---
+    Register-PSMMMainWindowEvents -Window $window
 
-    # ── Bind the Computer list to its ObservableCollection ────────────────────
-    $compListBox = Find-PSMMControl -Window $script:MainWindow -Name 'ComputerListBox'
+    # -- Bind ObservableCollections to WPF controls ---
     $script:ComputerList.Clear()
-    $compListBox.ItemsSource = $script:ComputerList
+    $script:SyncHash.ComputerListBox.ItemsSource = $script:ComputerList
 
-    # ── Bind the Module Inventory grid to the ObservableCollection ────────────
-    $grid = Find-PSMMControl -Window $script:MainWindow -Name 'ModuleDataGrid'
     $script:ModuleGrid.Clear()
-    $grid.ItemsSource = $script:ModuleGrid
+    $script:SyncHash.ModuleDataGrid.ItemsSource = $script:ModuleGrid
 
-    # ── Initial log entry ────────────────────────────────────────────────────
-    Write-PSMMLog -Severity 'INFO' -Message 'PS-ModuleManager v1.0.0 started.'
+    # -- Initial log entries ---
+    Write-PSMMLog -Severity 'INFO' -Message 'PS-ModuleManager v2.0.0 started (SyncHash + Dispatcher architecture).'
     Write-PSMMLog -Severity 'INFO' -Message "Settings loaded from: $SettingsPath"
     Write-PSMMLog -Severity 'INFO' -Message "Central share: $($script:Settings.CentralSharePath)"
     Write-PSMMLog -Severity 'INFO' -Message "Concurrency: $($script:Settings.MaxConcurrency) threads"
@@ -3322,23 +3564,20 @@ function Show-ModuleManagerGUI {
         Write-PSMMLog -Severity 'WARN' -Message 'Not running as Administrator -- install/update/remove to system-wide module paths will require elevation.'
     }
 
-    # ── Ensure window is topmost ───────────────────────────────────────────
-    #$script:MainWindow.Topmost = $true
+    # -- Set window properties ---
+    $window.WindowStartupLocation = $WindowStartupLocation
+    $window.WindowState = $WindowState
 
-    # ── Set window properties ──────────────────────────────────────────────
-    $script:MainWindow.WindowStartupLocation = $WindowStartupLocation
-    $script:MainWindow.WindowState = $WindowState
+    # -- Show the window (blocking call) ---
+    $window.ShowDialog() | Out-Null
 
-    # ── Show the window (blocking) ───────────────────────────────────────────
-    $script:MainWindow.ShowDialog() | Out-Null
-
-    # ── Cleanup ──────────────────────────────────────────────────────────────
+    # -- Cleanup ---
     Close-PSMMRunspacePool
     Write-Host 'PS-ModuleManager closed.' -ForegroundColor Cyan
 }
 #endregion Exported Function
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Module auto-export
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 Export-ModuleMember -Function 'Show-ModuleManagerGUI', 'Get-ADSIInfo'

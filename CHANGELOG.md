@@ -4,52 +4,60 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased] - 2026-02-17
+## [Unreleased]
+
+## [2.0.0] - 2026-02-18
 
 ### Added
 
-- `PSModulePath` property on `ModuleGridItem` for enhanced module path visibility in the UI
+- **SyncHash + Dispatcher architecture** -- centralized `[hashtable]::Synchronized(@{})` (`$script:SyncHash`) shared between all runspaces; all named WPF controls stored as `$syncHash.<ControlName>` for direct access from background threads
+- `Initialize-PSMMSyncHash` -- populates the syncHash with all named controls after XAML parsing
+- `Invoke-PSMMDispatcherUpdate` -- concise thread-safe UI mutation helper via `Dispatcher.Invoke()`
+- `Invoke-PSMMBackgroundRunspace` -- spawns runspaces with automatic `$syncHash` injection; replaces manual runspace wiring
+- `Invoke-PSMMSafeAction` -- wraps WPF event handlers in `try/catch` with `MessageBox` on unhandled exceptions; prevents silent GUI crashes
+- `Show-PSMMCredentialDialog` -- pure WPF dark-themed credential dialog (username TextBox + PasswordBox + OK/Cancel); replaces `Get-Credential` which caused WinForms deadlock on the WPF dispatcher thread
+- **In-place grid updates** -- `ModuleGridItem` properties are updated in-place via `INotifyPropertyChanged` (`Status = 'Scanning...'` → actual result); no `Clear()`/re-add on every inventory refresh; stale rows cleaned up after all jobs complete
+- **CheckBox dark theme** -- `ControlTemplate`-based `CheckBox` style applied to all three XAML windows (main, settings, credential dialog): 16×16 custom bullet with teal checkmark, dark fill, blue accent on checked
+- **Settings ↔ main window CheckBox sync** -- `ChkSkipServers` and `ChkSkipVirtual` are seeded from `$script:Settings` on window open; `Checked`/`Unchecked` handlers write back to `$script:Settings` and persist via `Export-PSMMSettings`; Settings dialog Save already synced the other direction
+- `PSModulePath` property on `ModuleGridItem` for module path visibility in the inventory grid
 - `ComputerItem` WPF data class with `INotifyPropertyChanged` for checkbox + connection status binding
 - `ModuleGridItem` WPF data class with `INotifyPropertyChanged` for reactive inventory grid
-- Job polling via `DispatcherTimer` with auto-refresh of inventory after Install/Update/Remove operations
-- `ExcludeServers` and `ExcludeVirtual` settings to filter computers during ADSI discovery
+- Job polling via `DispatcherTimer` (500 ms) with auto-refresh of inventory after Install/Update/Remove
+- `ExcludeServers` and `ExcludeVirtual` settings to filter computers during ADSI discovery; exposed as toolbar CheckBoxes (`ChkSkipServers`, `ChkSkipVirtual`) with pill-toggle visual indicators
 - `GlobalExcludeList` setting to permanently exclude specific computer names
 - `ModuleSearchPaths` setting to configure local module search directories
+- `OSFilter` setting for additional OS-based computer filtering
 - `Get-ADSIInfo` exported function for domain LDAP path and OU discovery
 - `PS-ModuleManager.ps1` self-elevating launcher script (auto-admin, console hiding)
 - `scripts/Create-Shortcut.ps1` to create a desktop shortcut for launching the module
 - `scripts/Get-ADSIInfo.ps1` standalone ADSI discovery script for populating settings
 - `-WindowStartupLocation` and `-WindowState` parameters on `Show-ModuleManagerGUI`
-- LICENSE file
-- VSCode settings for spell checking and terminal configuration
-- `.editorconfig` for consistent coding styles
-- `.gitattributes` for LF normalization
-- Test scripts in `test/` directory
-- Pester v5 test suite (`test/PS-ModuleManager.Tests.ps1`) covering non-WPF business logic
-- `ConvertTo-PSMMLdapSafeString` for LDAP injection protection in search filters
-- `Invoke-PSMMSafeAction` wrapper for graceful error recovery in WPF event handlers
-- Indeterminate `ProgressBar` in status bar during long-running operations
+- Pester v5 test suite (`test/PS-ModuleManager.Tests.ps1`) covering non-WPF business logic: `Get-PSMMDefaultSettings`, `Import-PSMMSettings`, `Test-PSMMSettings`, `Compare-PSMMModuleVersions`, `Get-PSMMShareModules`, `ConvertTo-PSMMLdapSafeString`
+- `ConvertTo-PSMMLdapSafeString` -- LDAP injection protection; escapes special characters before building `DirectorySearcher` filters
+- Indeterminate `ProgressBar` (`StatusProgress`) in the status bar; activated during long-running operations, hidden on completion
 - Export inventory to CSV button (`BtnExportCsv`) with `SaveFileDialog`
-- `Get-PSMMModuleDependencies` for `.psd1` manifest `RequiredModules` checking before install
-- Dependency warnings logged during `Install-PSMMModule` when `RequiredModules` are detected
-- "Invert Selection" button for bulk computer selection toggling
-- Settings import/export buttons in the Settings dialog (load from / save to external JSON)
-- `Invoke-PSMMLogRotation` for automatic log file cleanup (30-day retention, 10 MB cap)
-- Log rotation runs automatically on GUI startup
+- Export log to text file button (`BtnExportLog`) with `SaveFileDialog`
+- `Get-PSMMModuleDependencies` -- reads `.psd1` `RequiredModules` before install; logs warnings when dependencies are detected
+- "Select All", "Deselect All", and "Invert Selection" buttons for bulk computer list management
+- Settings import/export buttons in the Settings dialog (load from / save to external JSON via `OpenFileDialog` / `SaveFileDialog`)
+- `Invoke-PSMMLogRotation` -- automatic log cleanup: 30-day file retention, 10 MB total cap; runs on GUI startup
 - Keyboard shortcuts: `Ctrl+R` (Inventory), `Ctrl+S` (Settings), `Ctrl+E` (Export CSV), `Escape` (Cancel jobs)
-- Enhanced confirmation dialogs for Install/Update/Remove with detailed computer and module lists
+- Enhanced confirmation dialogs for Install/Update/Remove listing affected computers and modules
 - `.github/copilot-instructions.md` with coding standards and improvement roadmap
+- `LICENSE` file
 
 ### Changed
 
-- Enhance `Uninstall-PSMMModule` to accept `ModulePath` parameter and improve path handling
-- Refactor code to use `ObservableCollection` for automatic WPF UI updates on computer and module lists
-- Enhance UI layout with ScrollBar styles, dark theme refinements, and auto-refresh after operations
-- Improve `Get-ADSIInfo` error handling with fallback to local computer info when ADSI is unavailable
-- Expand module from ~1900 lines to ~2845 lines with additional features and UI enhancements
-- Update `MaxConcurrency` default behavior
-- Comprehensive README update with full settings reference and project structure
-- Create PLAN.md with detailed architecture and functional specification
+- **BREAKING** -- replaced all `$script:` UI state variables with `$script:SyncHash` hashtable; direct control references are now `$script:SyncHash.<ControlName>` instead of saved local variables
+- Reorganized module into `SyncHash Helpers` region (new) between `WPF XAML Definition` and `WPF Helpers`
+- `BtnCredentials.Add_Click` now calls `Show-PSMMCredentialDialog` instead of `Get-Credential` (fixes WPF dispatcher deadlock)
+- `Uninstall-PSMMModule` accepts `ModulePath` parameter for improved path handling
+- All module operations use `ObservableCollection` with in-place property updates (no grid clear/rebuild)
+- `Get-ADSIInfo` error handling improved with fallback to local computer info when ADSI is unavailable
+- Dark ScrollBar style applied globally (5 px thin scrollbars)
+- Module expanded from ~1900 lines (1.0.0) to ~3585 lines (2.0.0)
+- Comprehensive README and PLAN.md updates
+- Module version bumped to 2.0.0 in manifest
 
 ## [1.0.0] - 2026-02-16
 

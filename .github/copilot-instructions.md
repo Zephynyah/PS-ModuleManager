@@ -101,6 +101,7 @@ Current settings schema:
 | `ExcludeServers` | bool | `$false` |
 | `ExcludeVirtual` | bool | `$false` |
 | `GlobalExcludeList` | string[] | `@()` |
+| `OSFilter` | string | `''` |
 
 ---
 
@@ -195,18 +196,30 @@ The following enhancements would improve reliability, maintainability, and user 
 
 11. **Keyboard shortcuts** -- DONE. `Ctrl+R` = Inventory refresh, `Ctrl+S` = Settings, `Ctrl+E` = Export CSV, `Escape` = Cancel running jobs. Implemented via `PreviewKeyDown` on the main window.
 
+### Architecture (v2.0.0, all implemented)
+
+12. **SyncHash + Dispatcher pattern** -- DONE. `$script:SyncHash = [hashtable]::Synchronized(@{})` as central state store; `Initialize-PSMMSyncHash` populates all named WPF controls; `Invoke-PSMMDispatcherUpdate` and `Invoke-PSMMBackgroundRunspace` provide concise thread-safe UI update and runspace injection helpers.
+
+13. **In-place observable grid updates** -- DONE. `ModuleGridItem` properties updated in-place via `INotifyPropertyChanged` on every poll cycle; no `Clear()`/re-add; stale rows cleaned up after all jobs complete.
+
+14. **Pure WPF credential dialog** -- DONE. `Show-PSMMCredentialDialog` is a dark-themed WPF dialog (username TextBox + PasswordBox + OK/Cancel) that runs on the dispatcher thread, replacing `Get-Credential` which caused a WinForms deadlock.
+
+15. **Dark-mode CheckBox theme** -- DONE. `ControlTemplate`-based `CheckBox` style (16x16 bullet with teal checkmark, blue-filled on checked) applied to all three XAML windows (main, settings, credential dialog).
+
+16. **Settings ↔ main window CheckBox sync** -- DONE. `ChkSkipServers` and `ChkSkipVirtual` are seeded from `$script:Settings` on window load; `Checked`/`Unchecked` handlers persist changes via `Export-PSMMSettings`; Settings dialog Save syncs back to the main window toolbar.
+
 ### Low Priority / Future
 
-12. **PSGallery as a module source** -- Support `Install-Module` / `Find-Module` from the PowerShell Gallery as an alternative to the central share, with a toggle in settings.
+17. **PSGallery as a module source** -- Support `Install-Module` / `Find-Module` from the PowerShell Gallery as an alternative to the central share, with a toggle in settings.
 
-13. **HTML report generation** -- Generate a styled HTML report of the inventory diff (installed vs. target versions) for email distribution or intranet publishing.
+18. **HTML report generation** -- Generate a styled HTML report of the inventory diff (installed vs. target versions) for email distribution or intranet publishing.
 
-14. **Scheduled task integration** -- Add a function `Register-PSMMScheduledTask` that creates a Windows Scheduled Task to run unattended inventory scans and email reports.
+19. **Scheduled task integration** -- Add a function `Register-PSMMScheduledTask` that creates a Windows Scheduled Task to run unattended inventory scans and email reports.
 
-15. **Module version pinning** -- Allow pinning specific module versions per computer group so that not all machines are upgraded to the latest share version simultaneously (staged rollout).
+20. **Module version pinning** -- Allow pinning specific module versions per computer group so that not all machines are upgraded to the latest share version simultaneously (staged rollout).
 
-16. **Dark/Light theme toggle** -- Add a theme switcher in the UI. The current dark theme is hardcoded in XAML; extract color resources into a `ResourceDictionary` pattern for easy swapping.
+21. **Dark/Light theme toggle** -- Add a theme switcher in the UI. The current dark theme is hardcoded in XAML; extract color resources into a `ResourceDictionary` pattern for easy swapping.
 
-17. **Authenticode enforcement toggle** -- Add a setting `RequireSignedModules` (bool) that validates `Get-AuthenticodeSignature` on module ZIPs before extraction, blocking unsigned packages.
+22. **Authenticode enforcement toggle** -- Add a setting `RequireSignedModules` (bool) that validates `Get-AuthenticodeSignature` on module ZIPs before extraction, blocking unsigned packages.
 
-18. **Connection status caching** -- Cache WinRM reachability results for a configurable TTL (e.g., 5 minutes) so that switching between operations doesn't re-test every computer.
+23. **Connection status caching** -- Cache WinRM reachability results for a configurable TTL (e.g., 5 minutes) so that switching between operations doesn't re-test every computer.
