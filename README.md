@@ -4,6 +4,8 @@ A **single-file PowerShell module** (~3585 lines) with a WPF GUI for managing Po
 
 > **Requires Windows PowerShell 5.1** -- all code is PS 5.1-compatible. No PowerShell 7+ syntax.
 
+![Application Screenshot](docs/app.png)
+
 ## Features
 
 - **AD Computer Discovery** -- ADSI-based enumeration with OU filtering, wildcard search, and enabled-only toggle (no RSAT required)
