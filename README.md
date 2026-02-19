@@ -182,6 +182,10 @@ Invoke-Pester .\test\PS-ModuleManager.Tests.ps1 -Output Detailed
 
 Tests cover: `Get-PSMMDefaultSettings`, `Import-PSMMSettings`, `Test-PSMMSettings`, `Compare-PSMMModuleVersions`, `Get-PSMMShareModules`, `ConvertTo-PSMMLdapSafeString`.
 
+## Changes
+
+See [CHANGELOG](docs/CHANGELOG.md) for detailed change history.
+
 ## License
 
 See [LICENSE](LICENSE) for details.
